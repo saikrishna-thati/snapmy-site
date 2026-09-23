@@ -13,11 +13,21 @@
 .reel .frame.playing .play-hint{opacity:0}
 .reel figure .poster-ratio{position:absolute;right:14px;bottom:12px;font-size:10.5px;color:#fff;background:#0000008c;padding:5px 9px;border-radius:6px;letter-spacing:.04em;z-index:2;transition:opacity .3s}
 .reel figure:hover .poster-ratio{opacity:0}
-.reel .fig--9-16{grid-row:span 2}
 .reel .fig--9-16 .frame{aspect-ratio:9 / 16}
 .reel .fig--9-16 .poster b{font-size:clamp(1.05rem,.8rem + .9vw,1.6rem);-webkit-line-clamp:4}
 .reel .fig--1-1 .frame{aspect-ratio:1 / 1}
 .reel .fig--4-5 .frame{aspect-ratio:4 / 5}
+.reel figure{display:flex;flex-direction:column;min-width:0}
+.reel .fig{width:100%}
+.reel .fig .frame{display:block;position:relative;width:100%;height:auto;min-height:0;line-height:0}
+.reel .fig .frame .hfp,.reel .fig .frame canvas{position:absolute;inset:0;width:100%;height:100%}
+.reel .fig .frame .poster{line-height:1.2}
+.reel .fig:has(.frame[data-hero]){grid-column:span 2}
+@media (max-width:760px){.reel .fig:has(.frame[data-hero]){grid-column:auto}}
+.reel .fig .frame[data-hero]{border-color:var(--tally);box-shadow:0 0 0 1px color-mix(in srgb,var(--tally) 45%,transparent),0 18px 38px -18px color-mix(in srgb,var(--tally) 40%,transparent)}
+.reel .fig .frame[data-hero]:after{content:"Flagship";position:absolute;left:12px;top:12px;z-index:3;font-family:var(--font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--tally-ink);background:var(--tally);padding:4px 8px;border-radius:99px}
+.reel .fig:has(.frame[data-hero]) figcaption b:after{content:" · flagship";font-family:var(--font-mono);font-size:10.5px;font-weight:500;color:var(--tally)}
+.reel .fig .frame[data-verify="fail"]{outline:1px dashed #d9a441;outline-offset:2px}
 .panel-notes{list-style:none;display:grid;gap:10px;margin:10px 0 0;padding:0}
 .panel-notes li{border-left:2px solid var(--tally);padding:2px 0 2px 10px;font-size:var(--text-sm);line-height:1.45}
 .panel-notes li b{display:block;font-family:var(--font-mono);font-size:var(--text-xs);font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px}
