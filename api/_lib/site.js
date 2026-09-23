@@ -147,6 +147,196 @@ function toRgbHex(value) {
   return `#${[match[1], match[2], match[3]].map((part) => Math.max(0, Math.min(255, Math.round(Number(part)))).toString(16).padStart(2, "0")).join("")}`;
 }
 
+function normalizeHex(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  const short = raw.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
+  if (short) return `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`;
+  const long = raw.match(/^#([0-9a-f]{6})$/);
+  return long ? `#${long[1]}` : "";
+}
+
+function colorParts(value) {
+  const hex = normalizeHex(value);
+  if (!hex) return null;
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+
+function luminance(value) {
+  const rgb = colorParts(value);
+  if (!rgb) return null;
+  const [r, g, b] = rgb.map((channel) => {
+    const c = channel / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function saturation(value) {
+  const rgb = colorParts(value);
+  if (!rgb) return 0;
+  const [r, g, b] = rgb.map((channel) => channel / 255);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max === min) return 0;
+  const lightness = (max + min) / 2;
+  return lightness > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min);
+}
+
+function hexDistance(a, b) {
+  const ra = colorParts(a);
+  const rb = colorParts(b);
+  if (!ra || !rb) return 999;
+  return Math.sqrt((ra[0] - rb[0]) ** 2 + (ra[1] - rb[1]) ** 2 + (ra[2] - rb[2]) ** 2);
+}
+
+const NAV_WORDS = /^(?:skip (?:to|navigation)|menu|close|search|log ?in|sign ?in|sign ?up|sign out|get started(?: for free)?|start (?:free|for free|building|now|today)?|try (?:it |for )?free|book (?:a )?(?:demo|briefing|call)|learn more|read more|see more|contact(?: us)?|talk to (?:us|sales)|request (?:a )?demo|explore|overview|product|products|solutions|features?|platform|resources|company|about(?: us)?|pricing|plans|customers?|case studies|stories|docs?|documentation|developers?|api(?: reference)?|blog|careers?|jobs|support|help(?: center)?|faq|community|partners?|integrations?|security|trust|compliance|enterprise|changelog|status|news|events|webinars?|guides?|templates?|tools?|use cases?|why us|next|previous|back|home|language|english|privacy|terms|cookies?|legal|newsletter|subscribe|follow(?: us)?|download|install|get the app|open (?:the )?app|dashboard|settings|account|profile|logout|toggle|expand|collapse|show more|load more|view all|view more)$/i;
+
+function isNavigational(value) {
+  const text = cleanText(value);
+  if (!text || text.length < 2) return true;
+  if (NAV_WORDS.test(text)) return true;
+  if (text.length > 90) return true;
+  if (/[|›»←→]/.test(text)) return true;
+  if (/^(?:©|\(c\))/i.test(text)) return true;
+  return false;
+}
+
+function isRealColor(value) {
+  const hex = normalizeHex(value);
+  if (!hex) return false;
+  const lum = luminance(hex);
+  if (lum === null) return false;
+  if (lum > 0.94 || lum < 0.035) return false;
+  return saturation(hex) >= 0.12;
+}
+
+const STAT_LABEL_HINT = /(?:user|team|customer|company|business|developer|engineer|builder|creator|site|page|app|request|build|deploy|query|test|review|hour|minute|second|day|week|month|year|time|faster|faster|more|less|fewer|saved|growth|uptime|accuracy|reliability|conversion|revenue|retention|satisfaction|nps|rating|star|trusted|used|serving|processed|handled|monitored|tracked|managed|supported|available|free|off|discount|cost|price|saving)/i;
+
+function extractStats(text) {
+  const source = cleanText(text);
+  const found = [];
+  const re = /([$€£]\s?\d[\d,]*(?:\.\d+)?\s?(?:[BMKk])?|\b\d[\d,]*(?:\.\d+)?\s?(?:%|x|×|\+|k|K|M|B)\b|\b\d[\d,]*(?:\.\d+)?\s?(?:billion|million|thousand|users?|teams?|companies|customers?|developers?|hours?|minutes?|seconds?|days?|weeks?|months?|years?)\b)/g;
+  for (const match of source.matchAll(re)) {
+    const value = match[1].replace(/\s+/g, " ").trim();
+    const at = match.index || 0;
+    const before = source.slice(Math.max(0, at - 70), at);
+    const after = source.slice(at + value.length, at + value.length + 80);
+    const label = pickStatLabel(before, after);
+    if (!label) continue;
+    found.push({ value, label });
+  }
+  const seen = new Set();
+  return found.filter((stat) => {
+    const key = `${stat.value}|${stat.label}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 6);
+}
+
+function pickStatLabel(before, after) {
+  const tail = (before.match(/([A-Za-z][A-Za-z0-9%,'’&/+\-. ]{2,60})[.!?;:—–-]?\s*$/) || [])[1] || "";
+  const lead = (after.match(/^\s*(?:[A-Za-z][A-Za-z0-9%,'’&/+\-. ]{2,60})/) || [])[0] || "";
+  const candidates = [tail, lead].map((value) => cleanText(value).replace(/^[\s\-–—:]+/, "").replace(/[\s.,;:]+$/, "").trim());
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const words = candidate.split(/\s+/).filter(Boolean);
+    if (words.length < 1 || words.length > 7) continue;
+    if (words.length === 1 && !STAT_LABEL_HINT.test(candidate)) continue;
+    if (/^(?:the|a|an|and|or|of|to|in|on|for|with|by|at|from|is|are|was|were|we|you|it|this|that|our|your|their)$/i.test(candidate)) continue;
+    if (isNavigational(candidate)) continue;
+    if (/^(?:skip to|main content|toggle|open menu)/i.test(candidate)) continue;
+    if (/(?:\.(?:com|io|dev|ai|co|app|net|org)\b|\/|@|https?:)/i.test(candidate)) continue;
+    if (NAV_SEQUENCE.test(candidate)) continue;
+    if (/\b(?:MTok|per MTok|tokens? per|input|output|cache)\b/i.test(candidate)) continue;
+    if (/\b(?:K|M|B)\s+(?:K|M|B)\b/.test(candidate)) continue;
+    if (words.filter((word) => /^[A-Z]/.test(word)).length >= 3 && words.length >= 3) continue;
+    if (/\b(?:keyboard|billed|monthly|yearly|annually|per month|save|discount|coupon|shipping|buy now|add to cart|sold out|in stock)\b/i.test(candidate)) continue;
+    if (/\b(?:available at|billed|save)\b/i.test(candidate)) continue;
+    const clean = candidate
+      .replace(/\s*[-–—]\s*(?:annually|monthly|yearly)?\s*$/i, "")
+      .replace(/\s+\$?\d[\d,.]*\s*(?:K|M|B|%|x)?\s+[A-Z][A-Za-z]*\s*$/, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (!clean || clean.length < 3) continue;
+    return clean.length > 60 ? `${clean.slice(0, 59).trim()}…` : clean;
+  }
+  return "";
+}
+
+const NAV_SEQUENCE = /\b(?:products?|resources?|pricing|docs?|blog|playground|customers?|solutions?|enterprise|login|signup|demo|careers?|about|contact|support|trust|status)\b.*\b(?:products?|resources?|pricing|docs?|blog|playground|customers?|solutions?|enterprise|login|signup|demo|careers?|about|contact|support|trust|status)\b/i;
+
+function scoreFeature(title, desc, index) {
+  const text = cleanText(title);
+  if (!text) return -1;
+  let score = 12 - index * 0.6;
+  const words = text.split(/\s+/).length;
+  if (words >= 2 && words <= 7) score += 5;
+  else if (words <= 10) score += 2;
+  else score -= 3;
+  if (/[.!?]$/.test(text)) score += 1;
+  if (desc && cleanText(desc).length > 18) score += 4;
+  if (/\b(?:pricing|plans?|about|careers?|blog|support|contact|terms|privacy|cookies?|legal|login|sign ?in|sign ?up)\b/i.test(text)) score -= 9;
+  if (isNavigational(text)) score -= 12;
+  if (/^(?:why|what|how)\b/i.test(text)) score -= 2;
+  return score;
+}
+
+const FEATURE_STOP = /^(?:help|help and security|security|capabilities|features?|products?|solutions?|resources|platform|pricing|plans?|docs?|blog|faq|about|company|careers?|contact|support|integrations?|customers?|enterprise|overview|why \w+|how it works|use cases?|testimonials?|reviews?|more|learn more|get started|try (?:it )?free|book (?:a )?demo|request (?:a )?demo|sign (?:up|in)|log ?in)$/i;
+
+function pairFeatures(headings, paragraphs) {
+  const seen = new Set();
+  const candidates = [];
+  headings.forEach((heading, index) => {
+    const title = cleanText(heading);
+    if (!title || title.length > 90 || seen.has(title.toLowerCase())) return;
+    if (FEATURE_STOP.test(title)) return;
+    if (title.split(/\s+/).length === 1 && !/^(?:ai|api|sdk)$/i.test(title)) return;
+    seen.add(title.toLowerCase());
+    candidates.push({ title, desc: "", index });
+  });
+  const body = paragraphs.map((value) => cleanText(value)).filter((value) => value.length > 45);
+  for (const candidate of candidates) {
+    const needle = candidate.title.toLowerCase();
+    const direct = body.find((value) => value.toLowerCase().includes(needle));
+    if (direct) {
+      const after = direct.slice(direct.toLowerCase().indexOf(needle) + candidate.title.length).replace(/^[\s:—–-]+/, "").trim();
+      const firstSentence = (after.match(/^[^.!?]{25,180}[.!?]?/) || [])[0] || "";
+      if (firstSentence.length > 25) { candidate.desc = firstSentence.trim(); continue; }
+    }
+    const stem = needle.split(/\s+/).filter((word) => word.length > 4).slice(0, 2);
+    if (stem.length) {
+      const related = body.find((value) => {
+        const lower = value.toLowerCase();
+        return stem.some((word) => lower.includes(word)) && !lower.includes(needle);
+      });
+      if (related) {
+        const sentence = (cleanText(related).match(/^[^.!?]{30,170}[.!?]?/) || [])[0] || "";
+        if (sentence.length > 30) candidate.desc = sentence.trim();
+      }
+    }
+  }
+  const scored = candidates.map((candidate) => ({ ...candidate, score: scoreFeature(candidate.title, candidate.desc, candidate.index) }))
+    .filter((candidate) => candidate.score > 4)
+    .sort((a, b) => b.score - a.score);
+  return scored.slice(0, 6).map(({ title, desc }) => ({ title, desc: desc || "" }));
+}
+
+function brandColors(rawColors) {
+  const usable = [];
+  for (const value of rawColors) {
+    const hex = normalizeHex(value);
+    if (!hex || !isRealColor(hex)) continue;
+    if (usable.some((existing) => hexDistance(existing, hex) < 42)) continue;
+    usable.push(hex);
+  }
+  return usable
+    .map((hex) => ({ hex, sat: saturation(hex), lum: luminance(hex) }))
+    .sort((a, b) => b.sat - a.sat || Math.abs(0.5 - a.lum) - Math.abs(0.5 - b.lum))
+    .map((entry) => entry.hex)
+    .slice(0, 4);
+}
+
 function extractAssets(html, base) {
   const assets = [];
   for (const match of String(html || "").matchAll(/<img\b[^>]*>/gi)) {
@@ -178,17 +368,18 @@ function parsePage(url, html, { isMarkdown = false } = {}) {
   const plain = cleanText(visible).slice(0, 18000);
   const anchors = isMarkdown ? [] : linksFrom(source, url);
   const images = isMarkdown ? [] : extractAssets(source, url);
-  const colors = unique([
+  const rawColors = brandColors(unique([
     ...source.match(/#[0-9a-f]{3,8}\b/gi) || [],
     ...source.match(/rgba?\([^)]*\)/gi) || [],
-  ].map((value) => value.startsWith("rgb") ? toRgbHex(value) : value.toLowerCase()).filter(Boolean)).slice(0, 16);
+  ].map((value) => value.startsWith("rgb") ? toRgbHex(value) : value).filter(Boolean)));
+  const colors = rawColors;
   const fonts = unique([
     ...[...source.matchAll(/font-family\s*:\s*([^;}]+)/gi)].map((match) => clipped(match[1], 80)),
     ...[...source.matchAll(/family=([^&"']+)/gi)].map((match) => decodeURIComponent(match[1]).replace(/\+/g, " ")),
   ]).slice(0, 8);
-  const ctaTexts = isMarkdown ? [] : unique([...source.matchAll(/<(?:a|button)\b[^>]*>([\s\S]*?)<\/(?:a|button)>/gi)].map((match) => clipped(match[1], 80)).filter((text) => text.length > 1)).slice(0, 12);
-  const stats = unique((plain.match(/(?:\b\d[\d,.]*\s?[%x×+]?|[$€£]\s?\d[\d,.]*|\b\d{2,}\+?)/g) || []).map((value) => value.trim())).slice(0, 8).map((value) => ({ value, label: "" }));
-  const quotes = isMarkdown ? [] : tagTexts(visible, "blockquote").slice(0, 4).map((text) => ({ text, author: "" }));
+  const ctaTexts = isMarkdown ? [] : unique([...source.matchAll(/<(?:a|button)\b[^>]*>([\s\S]*?)<\/(?:a|button)>/gi)].map((match) => clipped(match[1], 80)).filter((text) => text.length > 1 && !isNavigational(text))).slice(0, 12);
+  const stats = isMarkdown ? [] : extractStats(plain);
+  const quotes = isMarkdown ? [] : tagTexts(visible, "blockquote").filter((text) => !isNavigational(text)).slice(0, 4).map((text) => ({ text, author: "" }));
   const icon = !isMarkdown && (source.match(/<link\b[^>]*(?:rel\s*=\s*["'][^"']*icon|rel\s*=\s*["']apple-touch-icon)[^>]*>/i) || [])[0];
   const logoTag = !isMarkdown && (source.match(/<(?:img|svg)\b[^>]*(?:logo|brand|wordmark)[^>]*>/i) || [])[0];
   const logo = absoluteUrl(icon ? attr(icon, "href") : logoTag ? attr(logoTag, "src") : metaValue(source, "og:image"), url);
@@ -279,17 +470,84 @@ function inferCategory(text) {
   return "software product";
 }
 
+function cleanBrandTitle(value, hostname) {
+  const text = clipped(value, 64);
+  if (!text) return "";
+  const parts = text.split(/\s[|–—·]\s|\s[-:]\s/).map((part) => part.trim()).filter(Boolean);
+  const brand = parts[0] || text;
+  if (brand.length >= 2 && brand.length <= 32 && !isNavigational(brand)) return brand;
+  return clipped(hostname.replace(/^www\./, "").split(".")[0].replace(/[-_]/g, " "), 32);
+}
+
+function pickHeadline(home) {
+  const candidates = unique(home.headings.slice(0, 8))
+    .map((value) => cleanText(value))
+    .filter((value) => value.length >= 12 && value.length <= 130 && !isNavigational(value));
+  if (!candidates.length) return home.title || "";
+  const titleStem = cleanText(home.title || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((word) => word.length > 3);
+  const scored = candidates.map((value, index) => {
+    let score = 14 - index * 1.6;
+    const words = value.split(/\s+/).length;
+    if (words >= 4 && words <= 12) score += 6;
+    else if (words <= 3) score -= 4;
+    else if (words > 16) score -= 5;
+    if (/[.!?]$/.test(value)) score -= 2;
+    if (/^(?:why|how|what|meet|introducing|welcome|welcome to)\b/i.test(value)) score -= 4;
+    if (/\b(?:with|without|for|that|your|every|more|less|faster|better|simpler|from|into|the|when|so)\b/i.test(value)) score += 2;
+    if (/\d/.test(value)) score += 1;
+    if (isNavigational(value)) score -= 14;
+    const stem = cleanText(value).toLowerCase().replace(/[^a-z0-9 ]/g, " ");
+    if (titleStem.length) {
+      const overlap = titleStem.filter((word) => stem.includes(word)).length / titleStem.length;
+      score += overlap * 3;
+    }
+    return { value, score };
+  }).sort((a, b) => b.score - a.score);
+  return scored[0].value;
+}
+
+function collectLogos(pages) {
+  const names = [];
+  for (const page of pages) {
+    for (const text of page.ctaTexts) {
+      const value = cleanText(text);
+      if (value.length < 2 || value.length > 24) continue;
+      if (isNavigational(value)) continue;
+      if (FEATURE_STOP.test(value)) continue;
+      if (/\b(?:free|annually|monthly|billed|save|demo|trial|plans?|pricing|integrations?|playground|setup|open source)\b/i.test(value)) continue;
+      if (/\d/.test(value)) continue;
+      if (!/^[A-Z][A-Za-z0-9&'’.\-]*(?: [A-Z][A-Za-z0-9&'’.\-]*){0,2}$/.test(value)) continue;
+      names.push(value);
+    }
+  }
+  return unique(names).slice(0, 5);
+}
+
 function buildBrief(normalized, pages, candidates, diagnostics, providerConfigured) {
   const home = pages[0];
   const allHeadings = unique(pages.flatMap((page) => page.headings));
-  const headline = home.headings[0] || home.title || normalized.hostname;
-  const name = clipped((home.title || normalized.hostname).split(/[|–—:-]/)[0], 48) || normalized.hostname;
-  const features = allHeadings.slice(1, 9).map((title) => ({ title, desc: "" }));
-  const allStats = pages.flatMap((page) => page.stats).filter((stat) => stat.value).slice(0, 6);
-  const allQuotes = pages.flatMap((page) => page.quotes).slice(0, 4);
-  const allLogos = unique(pages.flatMap((page) => page.ctaTexts).filter((text) => /[A-Z]{2,}|\b\w+\s+(?:teams?|companies|customers)/i.test(text))).slice(0, 8);
+  const allParagraphs = unique(pages.flatMap((page) => page.paragraphs));
+  const headline = pickHeadline(home) || home.title || normalized.hostname;
+  const name = cleanBrandTitle(home.title || normalized.hostname, normalized.hostname);
+  const headlineKey = cleanText(headline).toLowerCase();
+  const features = pairFeatures(allHeadings, allParagraphs)
+    .filter((feature) => cleanText(feature.title).toLowerCase() !== headlineKey)
+    .slice(0, 4);
+  const allStats = [];
+  for (const page of pages) {
+    for (const stat of page.stats) {
+      if (allStats.length >= 6) break;
+      const key = stat.value.toLowerCase();
+      if (allStats.some((existing) => existing.value.toLowerCase() === key)) continue;
+      if (/(?:^| )\$(?:0|100|17|20|200)(?:\b|$)/.test(stat.value) && /(?:more usage|than pro|from\b)/i.test(stat.label)) continue;
+      if (stat.label.length < 3) continue;
+      allStats.push(stat);
+    }
+  }
+  const allQuotes = pages.flatMap((page) => page.quotes).filter((quote) => quote.text && quote.text.length > 20).slice(0, 4);
+  const allLogos = collectLogos(pages);
   const logo = home.logo || "";
-  const colors = unique(pages.flatMap((page) => page.colors)).slice(0, 8);
+  const colors = unique(pages.flatMap((page) => page.colors)).slice(0, 4);
   const fonts = unique(pages.flatMap((page) => page.fonts)).slice(0, 8);
   const primary = candidates.filter((candidate) => candidate.kind !== "fullpage").filter((candidate) => candidate.viewport.width === 1440);
   const fullpage = candidates.find((candidate) => candidate.kind === "fullpage")?.url || "";
@@ -318,7 +576,7 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
     domain: normalized.hostname.replace(/^www\./, ""),
     url: normalized.href,
     headline: clipped(headline, 140),
-    description: clipped(home.description || home.paragraphs[0], 360),
+    description: clipped(home.description || allParagraphs[0] || "", 360),
     category: inferCategory(`${name} ${headline} ${home.description} ${features.map((feature) => feature.title).join(" ")}`),
     features,
     stats: allStats,
@@ -329,7 +587,7 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
     logoAspect: 0,
     screenshots: primary.map((candidate) => candidate.url).slice(0, 8),
     fullpage,
-    hookCandidates: unique([headline, ...home.headings, ...features.map((feature) => feature.title)]).slice(0, 8),
+    hookCandidates: unique([headline, ...home.headings, ...features.map((feature) => feature.title)].map((value) => cleanText(value)).filter((value) => value.length >= 6 && !isNavigational(value))).slice(0, 8),
     pages: pageRecords,
     pageRoles: pageRecords.map((page) => ({ url: page.url, role: page.role })),
     screenshotCandidates: candidates,
@@ -337,7 +595,7 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
     fullpages: fullpage ? [fullpage] : [],
     sourceAssets,
     interactionTrace: [],
-    visualTokens: { mode: colors.some((color) => /#(?:0[0-9a-f]|1[0-9a-f]|2[0-9a-f])/i.test(color)) ? "dark-signal" : "light-signal", typography: fonts[0] || "reader-inferred" },
+    visualTokens: { mode: colors.length && luminance(colors[0]) !== null && luminance(colors[0]) < 0.42 ? "dark-signal" : "light-signal", typography: fonts[0] || "reader-inferred" },
     evidence: {
       pages: pages.map((page, index) => ({
         url: page.url,
