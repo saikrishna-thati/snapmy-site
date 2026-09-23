@@ -103,7 +103,7 @@ function soundFor(scene) {
 
 async function kimiPlan(brief, decisions) {
   const key = typeof process.env.KIMI_KEY === "string" ? process.env.KIMI_KEY.trim() : "";
-  if (!key) return null;
+  if (!key) return { plan: null, error: "not_configured" };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 16000);
   const system = "You are Snapmy.site's senior creative director. Return only JSON. Use only facts in the brief. Produce 12-20 varied scenes using the allowed scene types, preserve real stats/quotes/logos, choose a style from kinetic/editorial/neon/pop/mono, and include panel notes plus shot_direction entries with purpose, visual, and sound intent. Avoid claiming interactions that the brief cannot support.";
@@ -115,14 +115,15 @@ async function kimiPlan(brief, decisions) {
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model: "kimi-k2.6", thinking: { type: "disabled" }, response_format: { type: "json_object" }, temperature: 0.35, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
     });
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const content = payload?.choices?.[0]?.message?.content;
-    if (!content) return null;
-    const parsed = JSON.parse(String(content).replace(/^```json\s*|\s*```$/g, ""));
-    return cleanPlan(parsed, brief, decisions);
-  } catch {
-    return null;
+     if (!response.ok) return { plan: null, error: `http_${response.status}` };
+     const payload = await response.json();
+     const content = payload?.choices?.[0]?.message?.content;
+     if (!content) return { plan: null, error: "empty_response" };
+     const parsed = JSON.parse(String(content).replace(/^```json\s*|\s*```$/g, ""));
+     const plan = cleanPlan(parsed, brief, decisions);
+     return plan ? { plan, error: null } : { plan: null, error: "invalid_plan" };
+   } catch (cause) {
+     return { plan: null, error: cause?.name === "AbortError" ? "timeout" : "request_failed" };
   } finally {
     clearTimeout(timer);
   }
@@ -170,12 +171,13 @@ async function directWebsite(input) {
   const style = chooseStyle(brief, seed);
   const decisions = { style, energy: brief.category === "editorial" ? 1.2 : 1.8, hook: brief.hookCandidates[0] || brief.headline || brief.name, motionVariation: motionVariation(brief, style), category: brief.category || "software product", source: "fallback" };
   const fallback = fallbackPlan(brief, decisions);
-  const generated = await kimiPlan(brief, decisions);
-  if (generated) {
-    return { decisions: { ...decisions, style: generated.style || decisions.style, source: "kimi" }, plan: generated, diagnostics: { director: "kimi", fallback: false, providerConfigured: true } };
-  }
-  const keyConfigured = Boolean(typeof process.env.KIMI_KEY === "string" && process.env.KIMI_KEY.trim());
-  return { decisions, plan: fallback, errors: { kimi: keyConfigured ? "Kimi was unavailable; deterministic server direction was used." : "Kimi is not configured; deterministic server direction was used." }, diagnostics: { director: "deterministic-fallback", fallback: true, providerConfigured: keyConfigured } };
+   const generated = await kimiPlan(brief, decisions);
+   if (generated?.plan) {
+     return { decisions: { ...decisions, style: generated.plan.style || decisions.style, source: "kimi" }, plan: generated.plan, diagnostics: { director: "kimi", fallback: false, providerConfigured: true } };
+   }
+   const keyConfigured = Boolean(typeof process.env.KIMI_KEY === "string" && process.env.KIMI_KEY.trim());
+   const reason = generated?.error || (keyConfigured ? "unknown" : "not_configured");
+   return { decisions, plan: fallback, errors: { kimi: keyConfigured ? `Kimi unavailable (${reason}); deterministic server direction was used.` : "Kimi is not configured; deterministic server direction was used." }, diagnostics: { director: "deterministic-fallback", fallback: true, providerConfigured: keyConfigured, kimi: reason } };
 }
 
 module.exports = { directWebsite };
