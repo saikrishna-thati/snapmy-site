@@ -101,32 +101,85 @@ function soundFor(scene) {
   return "Support the beat without masking the message.";
 }
 
-async function kimiPlan(brief, decisions) {
-  const key = typeof process.env.KIMI_KEY === "string" ? process.env.KIMI_KEY.trim() : "";
-  if (!key) return { plan: null, error: "not_configured" };
+const SYSTEM = [
+  "You are Snapmy.site's senior creative director. Return only JSON, no prose.",
+  "Use only facts present in the brief. Never invent pricing, customers, or features.",
+  "Produce 12-20 scenes as {\"scenes\":[...]}. Allowed scene types: coldopen, hook, statement, flashword, screen, scroll, feature, featureStack, stat, quote, logos, marquee, split, cta, endcard.",
+  "INCLUDE AT LEAST 3 scenes of type screen, scroll, or split so the real website screenshots are used as evidence. Set their \"shot\" to the index of the most relevant screenshot (0-based, within the count given in the brief).",
+  "SCENE FIELD RULES (a scene must use exactly the fields for its type):",
+  "coldopen/flashword -> {\"type\",\"word\"}",
+  "hook -> {\"type\",\"words\":[4 short strings]}",
+  "statement/marquee/split/cta/endcard -> {\"type\",\"text\"}",
+  "screen -> {\"type\",\"shot\":<int index of a screenshot>,\"caption\"}",
+  "scroll -> {\"type\",\"shot\":<int index of a screenshot>}",
+  "feature -> {\"type\",\"title\",\"sub\"}",
+  "featureStack -> {\"type\",\"items\":[3 short strings]}",
+  "stat -> {\"type\",\"value\",\"label\"} copied from the brief stats",
+  "quote -> {\"type\",\"text\",\"author\"} copied from the brief quotes",
+  "logos -> {\"type\",\"names\":[3-6 strings]} copied from the brief logos",
+  "Also return \"style\" from kinetic/editorial/neon/pop/mono, \"panel\" as an array of 4 {role,note}, and \"shot_direction\" with one {purpose,visual,sound} entry per scene.",
+].join(" ");
+
+function envKey(name) {
+  const value = process.env[name];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function groqKeys() {
+  const primary = envKey("GROQ_KEYS") || envKey("GROQ_KEY") || envKey("DIRECTOR_KEY");
+  const single = [envKey("GROQ_KEY_1"), envKey("GROQ_KEY_2"), envKey("GROQ_KEY_3"), envKey("GROQ_KEY_4"), envKey("GROQ_KEY_5"), envKey("GROQ_KEY_6")];
+  const all = [...primary.split(/[\s,]+/), ...single].map((key) => key.trim()).filter(Boolean);
+  return [...new Set(all)];
+}
+
+function parsePlanContent(content, brief, decisions) {
+  if (!content) return { plan: null, error: "empty_response" };
+  let parsed;
+  try {
+    parsed = JSON.parse(String(content).replace(/^```json\s*|\s*```$/g, ""));
+  } catch {
+    return { plan: null, error: "invalid_json" };
+  }
+  const plan = cleanPlan(parsed, brief, decisions);
+  return plan ? { plan, error: null } : { plan: null, error: "invalid_plan" };
+}
+
+async function requestGroq({ key, model, brief, decisions }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 16000);
-  const system = "You are Snapmy.site's senior creative director. Return only JSON. Use only facts in the brief. Produce 12-20 varied scenes using the allowed scene types, preserve real stats/quotes/logos, choose a style from kinetic/editorial/neon/pop/mono, and include panel notes plus shot_direction entries with purpose, visual, and sound intent. Avoid claiming interactions that the brief cannot support.";
+  const timer = setTimeout(() => controller.abort(), 25000);
   const user = JSON.stringify({ brief, initial_decisions: decisions, allowed_scene_types: [...SCENES] });
   try {
-    const response = await fetch("https://api.moonshot.ai/v1/chat/completions", {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       signal: controller.signal,
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "kimi-k2.6", thinking: { type: "disabled" }, response_format: { type: "json_object" }, max_completion_tokens: 2048, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+      body: JSON.stringify({ model, temperature: 0.6, max_completion_tokens: 3500, response_format: { type: "json_object" }, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }] }),
     });
-     if (!response.ok) return { plan: null, error: `http_${response.status}` };
-     const payload = await response.json();
-     const content = payload?.choices?.[0]?.message?.content;
-     if (!content) return { plan: null, error: "empty_response" };
-     const parsed = JSON.parse(String(content).replace(/^```json\s*|\s*```$/g, ""));
-     const plan = cleanPlan(parsed, brief, decisions);
-     return plan ? { plan, error: null } : { plan: null, error: "invalid_plan" };
-   } catch (cause) {
-     return { plan: null, error: cause?.name === "AbortError" ? "timeout" : "request_failed" };
+    if (!response.ok) return { plan: null, error: `http_${response.status}`, retryable: response.status === 429 || response.status === 401 || response.status === 403 || response.status >= 500 };
+    const payload = await response.json();
+    const result = parsePlanContent(payload?.choices?.[0]?.message?.content, brief, decisions);
+    return { ...result, retryable: result.error === "invalid_json" || result.error === "invalid_plan" };
+  } catch (cause) {
+    return { plan: null, error: cause?.name === "AbortError" ? "timeout" : "request_failed", retryable: true };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function groqPlan(brief, decisions) {
+  const keys = groqKeys();
+  if (!keys.length) return { provider: "groq", plan: null, error: "not_configured" };
+  const models = (envKey("GROQ_MODEL") || "openai/gpt-oss-120b").split(",").map((value) => value.trim()).filter(Boolean);
+  const offset = hash(`${brief.domain}|${brief.name}`) % keys.length;
+  let lastError = "unknown";
+  for (let step = 0; step < keys.length; step++) {
+    const key = keys[(offset + step) % keys.length];
+    const result = await requestGroq({ key, model: models[0], brief, decisions });
+    if (result.plan) return { provider: "groq", model: models[0], keyIndex: (offset + step) % keys.length, plan: result.plan, error: null };
+    lastError = result.error;
+    if (!result.retryable) return { provider: "groq", plan: null, error: lastError };
+  }
+  return { provider: "groq", plan: null, error: lastError };
 }
 
 function cleanPlan(raw, brief, decisions) {
@@ -171,13 +224,22 @@ async function directWebsite(input) {
   const style = chooseStyle(brief, seed);
   const decisions = { style, energy: brief.category === "editorial" ? 1.2 : 1.8, hook: brief.hookCandidates[0] || brief.headline || brief.name, motionVariation: motionVariation(brief, style), category: brief.category || "software product", source: "fallback" };
   const fallback = fallbackPlan(brief, decisions);
-   const generated = await kimiPlan(brief, decisions);
-   if (generated?.plan) {
-     return { decisions: { ...decisions, style: generated.plan.style || decisions.style, source: "kimi" }, plan: generated.plan, diagnostics: { director: "kimi", fallback: false, providerConfigured: true } };
-   }
-   const keyConfigured = Boolean(typeof process.env.KIMI_KEY === "string" && process.env.KIMI_KEY.trim());
-   const reason = generated?.error || (keyConfigured ? "unknown" : "not_configured");
-   return { decisions, plan: fallback, errors: { kimi: keyConfigured ? `Kimi unavailable (${reason}); deterministic server direction was used.` : "Kimi is not configured; deterministic server direction was used." }, diagnostics: { director: "deterministic-fallback", fallback: true, providerConfigured: keyConfigured, kimi: reason } };
+   const providers = [groqPlan];
+  const attempts = [];
+  for (const provider of providers) {
+    const generated = await provider(brief, decisions);
+    if (generated?.plan) {
+      return { decisions: { ...decisions, style: generated.plan.style || decisions.style, source: generated.provider }, plan: generated.plan, diagnostics: { director: generated.provider, model: generated.model || null, fallback: false, providerConfigured: true, attempts } };
+    }
+    attempts.push({ provider: generated?.provider || "unknown", error: generated?.error || "unknown" });
+  }
+  const providerConfigured = groqKeys().length > 0;
+  const errors = {};
+  for (const attempt of attempts) {
+    if (attempt.error === "not_configured") continue;
+    errors[attempt.provider] = `${attempt.provider} unavailable (${attempt.error}); deterministic server direction was used.`;
+  }
+  return { decisions, plan: fallback, errors: Object.keys(errors).length ? errors : { director: "No director provider is configured; deterministic server direction was used." }, diagnostics: { director: "deterministic-fallback", fallback: true, providerConfigured, attempts } };
 }
 
 module.exports = { directWebsite };
