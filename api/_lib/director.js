@@ -109,7 +109,7 @@ async function kimiPlan(brief, decisions) {
   const system = "You are Snapmy.site's senior creative director. Return only JSON. Use only facts in the brief. Produce 12-20 varied scenes using the allowed scene types, preserve real stats/quotes/logos, choose a style from kinetic/editorial/neon/pop/mono, and include panel notes plus shot_direction entries with purpose, visual, and sound intent. Avoid claiming interactions that the brief cannot support.";
   const user = JSON.stringify({ brief, initial_decisions: decisions, allowed_scene_types: [...SCENES] });
   try {
-    const response = await fetch("https://api.moonshot.ai/v1/chat/completions", {
+    const response = await fetch("https://api.moonshot.cn/v1/chat/completions", {
       method: "POST",
       signal: controller.signal,
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
