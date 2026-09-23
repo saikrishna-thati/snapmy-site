@@ -1,13 +1,13 @@
 // Snapmy.site studio — URL → read → direction → motion panel → launch film + original score.
 import { compose, fallbackPlan, STYLES, CUT, BEAT, palette } from "./composer.js";
 import { renderScore } from "./score.js";
-import { api, backendAlive, readInBrowser, kimiInBrowser, guessDecisions, normalizePlan } from "./direction.js";
+import { api, backendStatus, readInBrowser, kimiInBrowser, guessDecisions, normalizePlan } from "./direction.js";
 import { API } from "./config.js";
 import { SAMPLES } from "./samples.js";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const st = { brief: null, decisions: null, plan: null, raw: null, aspect: "16:9", style: "auto", seed: 0, comp: null, score: null, backend: null, token: 0 };
+const st = { brief: null, decisions: null, plan: null, raw: null, aspect: "16:9", style: "auto", seed: 0, comp: null, score: null, backend: null, render: null, token: 0 };
 
 /* ---------------- theme + small UI ---------------- */
 const root = document.documentElement;
@@ -118,7 +118,10 @@ async function run(url) {
   showStudio(); resetScan();
   $("studioTitle").textContent = url.replace(/^https?:\/\//, ""); $("studioStatus").textContent = "Reading";
   stage("home"); log("Opening " + url);
-  if (st.backend === null) st.backend = await backendAlive();
+  if (st.backend === null) {
+    const status = await refreshBackend();
+    if (status.ok && !st.render) log("Reader and director are online; MP4 export is not configured in this deployment.", "warn");
+  }
   let brief;
   try {
     if (st.backend) { log("Finding the pages that make your product matter"); stage("pages"); brief = (await api("/read", { url }, { timeout: 45000 })).brief; }
@@ -138,7 +141,7 @@ async function run(url) {
   if (st.backend) {
      log("Finding the strongest story angle");
      log("Shaping the film direction around your product");
-     try { const d = await api("/direct", { brief: slimBrief(brief) }, { timeout: 70000 }); decisions = d.decisions && d.decisions.style ? d.decisions : null; raw = d.plan; if (d.errors?.jev) log("Direction note: " + d.errors.jev.slice(0, 80), "warn"); if (d.errors?.kimi) log("Creative note: " + d.errors.kimi.slice(0, 80), "warn"); } catch (e) { log("Direction call failed: " + e.message, "err"); }
+     try { const d = await api("/direct", { brief }, { timeout: 70000 }); decisions = d.decisions && d.decisions.style ? d.decisions : null; raw = d.plan; if (d.errors?.jev) log("Direction note: " + d.errors.jev.slice(0, 80), "warn"); if (d.errors?.kimi) log("Creative note: " + d.errors.kimi.slice(0, 80), "warn"); } catch (e) { log("Direction call failed: " + e.message, "err"); }
   }
   if (!decisions) { decisions = guessDecisions(brief); log("Using the built-in style guess: " + STYLES[decisions.style].label, "warn"); }
    else log(`Direction set → ${STYLES[decisions.style]?.label || decisions.style}`, "ok");
@@ -151,8 +154,6 @@ async function run(url) {
   fillPanel();
   await build(tok);
 }
-function slimBrief(b) { return { ...b, screenshots: (b.screenshots || []).map(() => "img"), fullpage: "", logo: "" }; }
-
 async function build(tok = st.token, keepTime = false) {
   const brief = st.brief; if (!brief) return;
   const style = st.style !== "auto" ? st.style : st.plan.style || st.decisions?.style || "kinetic";
@@ -175,7 +176,7 @@ async function build(tok = st.token, keepTime = false) {
   stage("done"); $("scanOverlay").classList.add("done");
   $("studioStatus").textContent = `Ready · ${STYLES[style].label} · ${st.aspect}`;
   $("dirReadout").textContent = `${STYLES[style].label} · ${base.scenes.length} shots · ${tc(base.duration)}`;
-  $("exportBtn").disabled = false; $("remixBtn").disabled = false; $("projectBtn").disabled = false;
+  $("exportBtn").disabled = !st.render; $("remixBtn").disabled = false; $("projectBtn").disabled = false;
   paintTimeline(); fillScript();
   if (!keepTime) { try { p.muted = false; await p.play(); } catch { p.muted = true; p.play?.(); } setTimeout(() => { if (p.paused && (p.currentTime || 0) < 0.1) p.seek?.(0.9); }, 600); }
 }
@@ -247,7 +248,7 @@ $("remixBtn").addEventListener("click", async () => {
   $("remixBtn").disabled = true;
   if (st.decisions?.source !== "sample" && st.decisions?.source !== "heuristic" && st.backend) {
     toast("Motion panel is re-cutting the board");
-    try { const d = await api("/direct", { brief: slimBrief(st.brief) }, { timeout: 70000 }); if (d.plan) { st.raw = d.plan; st.plan = normalizePlan(d.plan, st.brief, st.decisions); fillPanel(); } } catch {}
+     try { const d = await api("/direct", { brief: st.brief }, { timeout: 70000 }); if (d.plan) { st.raw = d.plan; st.plan = normalizePlan(d.plan, st.brief, st.decisions); fillPanel(); } } catch {}
   }
   await build(st.token);
 });
@@ -257,8 +258,8 @@ $("newUrlBtn").addEventListener("click", () => { $("urlInput").value = ""; windo
 let exportJob = null;
 $("exportBtn").addEventListener("click", async () => {
   if (!st.comp) return;
-  if (st.backend === null) st.backend = await backendAlive();
-   if (!st.backend) { toast("The render service is offline. Download the project and render it when ready."); return; }
+  if (st.backend === null) await refreshBackend();
+  if (!st.backend || !st.render) { toast("MP4 rendering is not configured here. Download the project instead."); return; }
   const style = st.style !== "auto" ? st.style : st.plan.style || "kinetic";
    const html = compose(st.brief, { ...st.plan, style, motionVariation: st.plan.motionVariation || st.decisions?.motionVariation }, { aspect: st.aspect, seed: st.seed, audioSrc: st.score ? "score.wav" : undefined }).html;
   const audio = st.score ? await blobToDataUrl(st.score.blob) : null;
@@ -281,6 +282,12 @@ $("exportBtn").addEventListener("click", async () => {
 });
 $("cancelExport").addEventListener("click", () => { exportJob = null; $("exportOverlay").hidden = true; });
 const absApi = (u) => new URL(API.replace(/\/api$/, "") + u, location.href).href;
+async function refreshBackend() {
+  const status = await backendStatus();
+  st.backend = status.ok;
+  st.render = status.render?.available === true;
+  return status;
+}
 function blobToDataUrl(b) { return new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(b); }); }
 $("projectBtn").addEventListener("click", async () => {
   if (!st.comp) return;
@@ -297,4 +304,4 @@ $("urlForm").addEventListener("submit", (e) => { e.preventDefault(); const u = n
 document.querySelectorAll(".try .chip").forEach((c) => c.addEventListener("click", () => { $("urlInput").value = c.dataset.url; run("https://" + c.dataset.url); }));
 
 customElements.whenDefined("hyperframes-player").then(() => { heroInit(); reelInit(); });
-backendAlive().then((ok) => (st.backend = ok));
+refreshBackend();

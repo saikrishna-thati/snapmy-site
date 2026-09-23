@@ -1,7 +1,7 @@
 // Snapmy.site launch-film composer
 // Turns a site brief + a directed plan into a player-compatible HTML composition
 // (data-composition-id root, class="clip" timed layers, one paused GSAP timeline).
-// Every scene is exactly one bar (1.5 s @ 160 BPM), so every cut lands on a downbeat.
+// Scene boundaries stay on the 160 BPM beat grid, while shots can hold for different spans.
 
 export const CUT = 1.5;
 export const BEAT = CUT / 4;
@@ -86,13 +86,7 @@ export const SCENE_TYPES = ["coldopen", "hook", "statement", "flashword", "scree
 
 // Product scenes share one browser window. Keeping this list deliberately small
 // means the rig only persists while the viewer is looking at the product world.
-const WINDOW_SCENE_TYPES = new Set(["screen", "scroll", "feature", "featureStack", "stat", "split"]);
-const WINDOW_WAYPOINTS = [
-  [0, 0, 0],
-  [300, -150, -400],
-  [600, 0, -200],
-  [420, 120, -280],
-];
+const WINDOW_SCENE_TYPES = new Set(["screen", "scroll", "split"]);
 
 // SFX cue each transition / scene type implies (consumed by the score engine)
 const TRANSITION_SFX = { whip: "swoosh_fast", zoom: "swoosh_air", flash: "rev_glass", wipe: "swoosh_mid", iris: "swoosh_low", glitch: "glitch", push: "swoosh_mid", cut: null, blocks: "swoosh_fast" };
@@ -107,6 +101,7 @@ export function hash(str) { let h = 2166136261; for (let i = 0; i < str.length; 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const J = (v) => JSON.stringify(v);
 const r3 = (n) => Math.round(n * 1000) / 1000;
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 
 function hexToRgb(h) { h = String(h || "").replace("#", ""); if (h.length === 3) h = h.split("").map((c) => c + c).join(""); const n = parseInt(h, 16); if (isNaN(n) || h.length !== 6) return null; return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
 const rgbToHex = ([r, g, b]) => "#" + [r, g, b].map((x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, "0")).join("");
@@ -114,6 +109,158 @@ function lum(hex) { const c = hexToRgb(hex) || [0, 0, 0]; const f = (v) => { v /
 export function contrast(a, b) { const l1 = lum(a), l2 = lum(b); return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05); }
 function mix(a, b, t) { const x = hexToRgb(a) || [0, 0, 0], y = hexToRgb(b) || [0, 0, 0]; return rgbToHex(x.map((v, i) => v + (y[i] - v) * t)); }
 function saturation(hex) { const c = hexToRgb(hex); if (!c) return 0; const mx = Math.max(...c), mn = Math.min(...c); return mx === 0 ? 0 : (mx - mn) / mx; }
+
+/* ---------------- evidence + timing ---------------- */
+function focalPoint(value, fallback = { x: 0.5, y: 0.5 }) {
+  const coord = (v, fallbackValue) => { const n = typeof v === "string" ? parseFloat(v) : Number(v); return Number.isFinite(n) ? (n > 1 ? n / 100 : n) : fallbackValue; };
+  const raw = value?.focalPoint || value?.focal_point || value?.crop?.focalPoint || value?.crop?.focal_point || value?.focus;
+  if (Array.isArray(raw)) return { x: clamp(coord(raw[0], fallback.x), 0, 1), y: clamp(coord(raw[1], fallback.y), 0, 1) };
+  if (typeof raw === "string") {
+    const p = raw.split(/[\s,]+/).map((n) => parseFloat(n));
+    if (p.length >= 2 && p.every(Number.isFinite)) return { x: clamp(p[0] > 1 ? p[0] / 100 : p[0], 0, 1), y: clamp(p[1] > 1 ? p[1] / 100 : p[1], 0, 1) };
+  }
+  if (raw && typeof raw === "object") return { x: clamp(coord(raw.x ?? raw.left, fallback.x), 0, 1), y: clamp(coord(raw.y ?? raw.top, fallback.y), 0, 1) };
+  return fallback;
+}
+
+function assetInfo(value, index = 0, role = "visual") {
+  if (!value) return null;
+  if (typeof value === "string") return { id: `asset-${index + 1}`, url: value, role, focalPoint: { x: 0.5, y: 0.5 } };
+  if (typeof value !== "object") return null;
+  const url = value.url || value.src || value.image || value.href || value.path;
+  if (!url) return null;
+  const width = Number(value.width || value.naturalWidth || 0) || 0;
+  const height = Number(value.height || value.naturalHeight || 0) || 0;
+  const fp = focalPoint(value);
+  return {
+    ...value,
+    id: String(value.id || value.key || `asset-${index + 1}`),
+    url: String(url),
+    role: value.role || role,
+    page: value.page || value.route || "",
+    width,
+    height,
+    focalPoint: fp,
+    fullPage: Boolean(value.fullPage || value.fullpage || value.isFullPage || role === "fullpage" || (height > width * 1.4 && height > 0)),
+  };
+}
+
+function collectAssets(brief = {}) {
+  const out = []; const seen = new Set();
+  const add = (value, role) => {
+    const a = assetInfo(value, out.length, role); if (!a) return;
+    const existing = out.find((item) => item.url === a.url);
+    if (existing) { if (a.fullPage) { existing.fullPage = true; existing.role = existing.role === "screen" ? "workflow" : existing.role; } return; }
+    seen.add(a.url); out.push(a);
+  };
+  const assets = [
+    ...(Array.isArray(brief.assets) ? brief.assets : brief.assets ? Object.values(brief.assets) : []),
+    ...(Array.isArray(brief.evidenceAssets) ? brief.evidenceAssets : []),
+    ...(Array.isArray(brief.sourceAssets) ? brief.sourceAssets : []),
+  ];
+  assets.forEach((a) => add(a, a?.role || "visual"));
+  (brief.screenshots || []).forEach((a) => add(a, a?.role || "screen"));
+  if (brief.fullpage) add(brief.fullpage, "fullpage");
+  (brief.fullpages || []).forEach((a) => add(a, "fullpage"));
+  return out;
+}
+
+function resolveAsset(value, assets = []) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isInteger(value)) return assets[value] || null;
+  if (typeof value === "string") return assets.find((a) => a.id === value || a.url === value) || assetInfo(value, assets.length);
+  if (typeof value === "object") return assetInfo(value, assets.length, value.role || "visual");
+  return null;
+}
+
+function assignAssets(scenes, assets) {
+  let previous = null;
+  return scenes.map((scene, index) => {
+    const visual = ["screen", "scroll", "split"].includes(scene.type);
+    if (!visual) return { ...scene, asset: null };
+    const explicit = scene.asset ?? scene.src ?? (Number.isInteger(scene.shot) ? assets[scene.shot] : null);
+    const requested = resolveAsset(explicit, assets);
+    const candidates = assets.filter((a) => scene.type !== "scroll" || a.fullPage);
+    const reusable = Boolean(scene.allowRepeat || scene.matchCut || scene.holdAsset);
+    let asset = requested;
+    if (!asset && candidates.length) asset = candidates.find((a) => a.id !== previous) || (reusable ? candidates[0] : null);
+    if (asset && asset.id === previous && !reusable) {
+      const alternate = candidates.find((a) => a.id !== previous);
+      asset = alternate || null;
+    }
+    if (scene.type === "scroll" && asset && !asset.fullPage && !scene.allowStillScroll) asset = null;
+    if (asset) previous = asset.id;
+    return { ...scene, asset };
+  });
+}
+
+function shotTiming(scene, index, rand) {
+  const defaults = { coldopen: 1.5, hook: 1.125, statement: 1.5, flashword: 1.125, screen: 2.25, scroll: 2.625, feature: 1.5, featureStack: 1.875, stat: 1.875, quote: 2.25, logos: 1.5, marquee: 1.5, split: 2.25, cta: 2.25, endcard: 2.625 };
+  const requested = Number(scene.duration ?? scene.durationSeconds ?? 0);
+  const variance = requested > 0 ? 0 : (index % 3 === 1 ? rand.range(-0.12, 0.12) : index % 3 === 2 ? rand.range(-0.08, 0.16) : 0);
+  const raw = requested > 0 ? requested : (defaults[scene.type] || CUT) + variance;
+  const span = clamp(Math.round(raw / BEAT) * BEAT, BEAT * 3, CUT * 3.5);
+  const entrance = scene.type === "screen" || scene.type === "scroll" || scene.type === "split" ? BEAT * 1.8 : BEAT * 1.2;
+  const followThrough = clamp(Number(scene.followThrough ?? scene.follow_through ?? (scene.type === "cta" || scene.type === "endcard" ? 0.3 : 0.18)), 0.08, 0.45);
+  const hold = clamp(Number(scene.hold ?? (span - entrance - followThrough)), BEAT * 0.55, Math.max(BEAT * 0.55, span - BEAT * 0.3));
+  return { span, entrance, hold, followThrough };
+}
+
+function shotMotion(scene, index, type, motion, rand) {
+  const map = { coldopen: "reveal", hook: "staccato", statement: "clarify", flashword: "impact", screen: "focus", scroll: "scan", feature: "reveal", featureStack: "cascade", stat: "count", quote: "settle", logos: "assemble", marquee: "glide", split: "compare", cta: "commit", endcard: "land" };
+  const source = typeof scene.motion === "object" ? scene.motion : {};
+  const intent = scene.motionIntent || scene.motion_intent || (typeof scene.motion === "string" ? scene.motion : source.intent) || map[type] || "reveal";
+  const direction = Number(source.direction ?? scene.direction ?? ((index + (motion.camera === "orbit" ? 1 : 0)) % 2 ? 1 : -1)) < 0 ? -1 : 1;
+  return {
+    intent,
+    direction,
+    anticipation: clamp(Number(source.anticipation ?? scene.anticipation ?? (intent === "impact" || intent === "commit" ? 0.16 : 0.08)), 0, 0.28),
+    overshoot: clamp(Number(source.overshoot ?? scene.overshoot ?? (intent === "land" || intent === "settle" ? 0.018 : 0.035)), 0, 0.08),
+    followThrough: clamp(Number(source.followThrough ?? scene.followThrough ?? scene.follow_through ?? (intent === "glide" ? 0.24 : 0.16)), 0.08, 0.45),
+    tilt: clamp(Number(source.tilt ?? scene.tilt ?? (motion.tilt || 0) * 0.18 + rand.range(-0.3, 0.3)), -2.5, 2.5),
+  };
+}
+
+function effectPolicy(brief = {}, plan = {}, motion = {}, style = {}) {
+  const requested = plan.treatment || plan.effects || {};
+  const fx = Array.isArray(requested) ? Object.fromEntries(requested.map((x) => [x, true])) : (requested && typeof requested === "object" ? requested : {});
+  const productTone = `${brief.category || ""} ${brief.domain || ""} ${brief.name || ""}`.toLowerCase();
+  const signal = /(crypto|web3|gaming|developer|terminal|cli|security|cyber|music)/.test(productTone);
+  return {
+    chrome: fx.chrome === true || fx.browserFrame === true,
+    hud: fx.hud === true,
+    glare: fx.glare === true,
+    vignette: fx.vignette === true ? 0.16 : 0,
+    grain: clamp(Number(fx.grain ?? (fx.texture ? 0.018 : 0)), 0, 0.04),
+    scan: fx.scan === true && signal,
+    glitch: fx.glitch === true && signal,
+    flash: fx.flash === true,
+    blocks: fx.blocks === true,
+    contrast: fx.contrast === true,
+    effect: fx.effect || (signal && motion.effect === "scan" ? "scan" : "clean"),
+  };
+}
+
+function targetBounds(asset, scene, W, H) {
+  const raw = scene.target || scene.targetBounds || asset?.target || asset?.targetBounds;
+  if (!raw || typeof raw !== "object") return null;
+  const x = Number(raw.x ?? raw.left), y = Number(raw.y ?? raw.top), w = Number(raw.width ?? raw.w), h = Number(raw.height ?? raw.h);
+  if (![x, y, w, h].every(Number.isFinite)) return null;
+  const normalized = Math.max(Math.abs(x), Math.abs(y), Math.abs(w), Math.abs(h)) <= 1;
+  return { x: (normalized ? x * W : x), y: (normalized ? y * H : y), w: (normalized ? w * W : w), h: (normalized ? h * H : h) };
+}
+
+function targetMarkup(id, asset, scene, W, H, u) {
+  const b = targetBounds(asset, scene, W, H); if (!b) return "";
+  return `<div class="target-mark" id="${id}-target" style="left:${Math.round(b.x)}px;top:${Math.round(b.y)}px;width:${Math.max(4, Math.round(b.w))}px;height:${Math.max(4, Math.round(b.h))}px"></div>`;
+}
+
+function assetStyle(asset, top = 0) {
+  if (!asset?.url) return `top:${top}px`;
+  const fp = focalPoint(asset);
+  const fit = asset.crop?.fit === "contain" || asset.fit === "contain" ? "contain" : "cover";
+  return `top:${top}px;background-image:url('${esc(asset.url)}');background-position:${Math.round(fp.x * 100)}% ${Math.round(fp.y * 100)}%;background-size:${fit}`;
+}
 
 export function palette(brief, style) {
   const cols = (brief.colors || []).filter((c) => hexToRgb(c));
@@ -144,8 +291,8 @@ function clip(text, n) { const s = String(text || "").trim(); if (s.length <= n)
 
 /* ---------------- transitions ---------------- */
 function transitionCode(kind, O, I, T, ctx) {
-  const { W, H, dir, motion = {} } = ctx; const L = [];
-  const blur = motion.blur || 28;
+  const { W, H, dir, motion = {}, treatment = {} } = ctx; const L = [];
+  const blur = treatment.contrast ? Math.min(18, motion.blur || 18) : Math.min(8, motion.blur || 8);
   const x = Math.round(W * 0.38) * dir;
   switch (kind) {
     case "whip":
@@ -195,25 +342,34 @@ function transitionCode(kind, O, I, T, ctx) {
 /* ---------------- scenes ---------------- */
 // each builder returns { html, code: string[] } ; t0 = downbeat of the scene
 function sceneBuilders(ctx) {
-  const { W, H, P, S, brief, u, portrait, motion } = ctx;
+  const { W, H, P, S, brief, u, portrait, motion, treatment } = ctx;
   const windowed = () => Boolean(ctx.windowed);
+  const timing = () => ctx.timing || { span: CUT, hold: CUT * 0.5, followThrough: 0.16 };
+  const spec = () => ctx.motionSpec || { direction: 1, followThrough: 0.16, overshoot: 0.03, anticipation: 0.08 };
   const up = (s) => (S.upper ? String(s).toUpperCase() : String(s));
   const padX = Math.round(W * (portrait ? 0.08 : 0.075));
   const innerW = W - padX * 2;
-  const shots = (brief.screenshots || []).filter(Boolean);
-  const shot = (i) => shots.length ? shots[i % shots.length] : null;
   const kicker = (id, text) => `<div class="kick" id="${id}-k"><span class="dot"></span>${esc(text)}</div>`;
   const kickerIn = (id, t0) => `tl.fromTo("#${id}-k",{opacity:0,x:-24},{opacity:1,x:0,duration:.4,ease:"expo.out"},${r3(t0 + 0.05)});`;
-  const drift = (id, t0, amt = 0.045) => `tl.fromTo("#${id} .cam",{scale:1},{scale:${1 + amt},duration:${CUT + 0.4},ease:"none"},${r3(t0 - 0.2)});`;
-  const interactionCode = (sc, id, t0, type) => {
+  const drift = (id, t0, amt = 0.045) => {
+    const span = Math.max(BEAT, timing().span);
+    const follow = Math.min(spec().followThrough || timing().followThrough || 0.16, span * 0.28);
+    const dx = Math.round((spec().direction || 1) * amt * W * 0.012);
+    return [`tl.fromTo("#${id} .cam",{scale:1,x:0},{scale:${1 + amt * 0.72},x:${dx},duration:${r3(Math.max(BEAT, span - follow))},ease:"sine.inOut"},${r3(t0)});`, `tl.to("#${id} .cam",{scale:${1 + amt},x:${Math.round(dx * 0.35)},duration:${r3(follow)},ease:"power2.out"},${r3(t0 + span - follow)});`].join("");
+  };
+  const assetFor = (sc) => sc.asset || null;
+  const hasFrame = (sc) => sc.browserFrame === true || (sc.browserFrame !== false && treatment.chrome);
+  const chrome = () => `<div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>`;
+  const interactionCode = (sc, id, t0, type, asset) => {
     const mode = sc.interaction || (type === "scroll" ? "scroll" : type === "screen" ? motion.interaction : "none");
+    const target = targetBounds(asset, sc, W, H);
     const code = [];
-    if (["click", "tab", "toggle", "modal"].includes(mode)) {
-      code.push(`tl.to("#${id}-anchor",{scale:1.14,duration:.09,ease:"power2.in"},${r3(t0 + 0.68)});`, `tl.to("#${id}-anchor",{scale:1,duration:.3,ease:"back.out(1.7)"},${r3(t0 + 0.77)});`);
+    if (target && ["click", "tab", "toggle", "modal"].includes(mode)) {
+      code.push(`tl.fromTo("#${id}-target",{opacity:0,scale:.94},{opacity:.72,scale:1,duration:.18,ease:"power2.out"},${r3(t0 + Math.min(timing().span * 0.46, timing().span - BEAT))});`, `tl.to("#${id}-target",{opacity:.18,scale:1.035,duration:${r3(Math.min(.34, timing().followThrough + .12))},ease:"sine.out"},${r3(t0 + Math.min(timing().span * 0.62, timing().span - BEAT * 0.6))});`);
     }
-    if (mode === "modal") code.push(`tl.fromTo("#${id}-b",{filter:"brightness(1)"},{filter:"brightness(1.22)",duration:.12,yoyo:true,repeat:1,ease:"power2.inOut"},${r3(t0 + 0.68)});`);
+    if (target && mode === "modal") code.push(`tl.fromTo("#${id}-b",{filter:"brightness(1)"},{filter:"brightness(1.1)",duration:.12,yoyo:true,repeat:1,ease:"power2.inOut"},${r3(t0 + Math.min(timing().span * 0.58, timing().span - BEAT * 0.5))});`);
     const sfx = { click: "mouse_click_b", tab: "ui_tick", toggle: "toggle", modal: "confirm", hover: "swoosh_air", scroll: "mouse_down" }[mode];
-    return { code, hits: sfx ? [{ t: t0 + (mode === "scroll" ? 0.2 : 0.68), sfx, gain: mode === "hover" ? 0.22 : 0.38 }] : [] };
+    return { code, hits: target && sfx ? [{ t: t0 + (mode === "scroll" ? Math.min(.2, timing().span * .18) : Math.min(timing().span * .58, timing().span - BEAT * 0.5)), sfx, gain: mode === "hover" ? 0.18 : 0.3 }] : [] };
   };
 
   return {
@@ -265,36 +421,41 @@ function sceneBuilders(ctx) {
       return { html, code, hits: [{ t: t0, sfx: "boom", gain: 0.55 }] };
     },
     screen(sc, id, t0, idx) {
-      const src = sc.src || shot(sc.shot ?? idx);
+      const asset = assetFor(sc);
       const fw = portrait ? W * 0.9 : W * 0.74;
       const fh = fw * (portrait ? 1.25 : 0.6);
       const cap = sc.caption ? `<div class="cap disp" id="${id}-cap" style="font-size:${Math.round(u * (portrait ? 6 : 5.2))}px">${esc(up(clip(sc.caption, 34)))}</div>` : "";
-      const body = src ? `<div class="shot" style="background-image:url('${src}')"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
-      const page = `<div class="window-page" id="${id}-b">${body}<div class="glare" id="${id}-g"></div></div>`;
-      const html = windowed() ? `<div class="cam center persp window-cam">${page}${cap}<div class="shared-anchor" id="${id}-anchor"><i></i></div></div>` : `<div class="cam center persp"><div class="browser" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px"><div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>${body}<div class="glare" id="${id}-g"></div></div>${cap}<div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const frame = hasFrame(sc);
+      const bodyTop = windowed() ? 0 : (frame ? Math.round(u * 4.4) : 0);
+      const body = asset?.url ? `<div class="shot" style="${assetStyle(asset, bodyTop)}"></div>` : `<div class="shot ghost" style="top:${bodyTop}px"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const page = `<div class="window-page" id="${id}-b">${body}${treatment.glare ? `<div class="glare" id="${id}-g"></div>` : ""}</div>`;
+      const mark = targetMarkup(id, asset, sc, W, H, u);
+      const html = windowed() ? `<div class="cam center persp window-cam">${page}${cap}${mark}</div>` : `<div class="cam center persp"><div class="browser ${frame ? "" : "clean-browser"}" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame ? chrome() : ""}${body}${treatment.glare ? `<div class="glare" id="${id}-g"></div>` : ""}</div>${cap}${mark}</div>`;
+      const active = Math.max(BEAT, timing().span);
       const code = [
-        `tl.fromTo("#${id}-b",{rotateX:22,rotateY:${portrait ? 0 : -8},y:${Math.round(H * 0.12)},scale:.86},{rotateX:4,rotateY:0,y:0,scale:1,duration:.9,ease:"expo.out"},${r3(t0)});`,
-        `tl.to("#${id}-b",{rotateX:0,scale:1.04,duration:${CUT - 0.6},ease:"sine.inOut"},${r3(t0 + 0.9)});`,
-        `tl.fromTo("#${id}-g",{xPercent:-120},{xPercent:140,duration:1.1,ease:"power2.inOut"},${r3(t0 + 0.25)});`,
-        sc.caption ? `tl.fromTo("#${id}-cap",{opacity:0,y:30},{opacity:1,y:0,duration:.45,ease:"expo.out"},${r3(t0 + BEAT * 2)});` : "",
-        `tl.fromTo("#${id}-anchor",{opacity:0,scale:.72},{opacity:1,scale:1,duration:.36,ease:"power2.out"},${r3(t0 + 0.12)});`,
+        `tl.fromTo("#${id}-b",{rotateX:${frame ? 14 : 5},rotateY:${frame && !portrait ? -5 : 0},y:${Math.round(H * (frame ? 0.08 : 0.025))},scale:${frame ? .92 : .98}},{rotateX:${frame ? 2 : 0},rotateY:0,y:0,scale:1,duration:${r3(Math.min(.8, active * .42))},ease:"power3.out"},${r3(t0)});`,
+        `tl.to("#${id}-b",{rotateX:0,scale:${frame ? 1.018 : 1.01},duration:${r3(Math.max(BEAT, active - Math.min(.8, active * .42)))},ease:"sine.inOut"},${r3(t0 + Math.min(.8, active * .42))});`,
+        treatment.glare ? `tl.fromTo("#${id}-g",{xPercent:-120},{xPercent:140,duration:${r3(Math.min(1.1, active * .6))},ease:"power2.inOut"},${r3(t0 + Math.min(.25, active * .12))});` : "",
+        sc.caption ? `tl.fromTo("#${id}-cap",{opacity:0,y:30},{opacity:1,y:0,duration:${r3(Math.min(.45, active * .25))},ease:"expo.out"},${r3(t0 + Math.min(BEAT * 2, active * .55))});` : "",
       ];
-      const interaction = interactionCode(sc, id, t0, "screen");
+      const interaction = interactionCode(sc, id, t0, "screen", asset);
       return { html, code: [...code, ...interaction.code], hits: interaction.hits };
     },
     scroll(sc, id, t0, idx) {
-      const src = sc.src || brief.fullpage || shot(sc.shot ?? idx);
+      const asset = assetFor(sc);
       const fw = portrait ? W * 0.86 : W * 0.62;
       const fh = portrait ? H * 0.7 : H * 0.8;
-      const body = src ? `<img class="tall" id="${id}-img" src="${src}" alt="">` : `<div class="shot ghost tallghost" id="${id}-img"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const body = asset?.url ? `<img class="tall" id="${id}-img" src="${esc(asset.url)}" alt="" style="object-position:${Math.round(focalPoint(asset).x * 100)}% ${Math.round(focalPoint(asset).y * 100)}%">` : `<div class="shot ghost tallghost" id="${id}-img"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div><div class="gh2"></div><div class="gh3"></div></div>`;
       const page = `<div class="window-page" id="${id}-b"><div class="viewport">${body}</div></div>`;
-      const html = windowed() ? `<div class="cam center window-cam">${page}<div class="shared-anchor" id="${id}-anchor"><i></i></div></div>` : `<div class="cam center"><div class="browser" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px"><div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div><div class="viewport">${body}</div></div><div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const frame = hasFrame(sc);
+      const mark = targetMarkup(id, asset, sc, W, H, u);
+      const html = windowed() ? `<div class="cam center window-cam">${page}${mark}</div>` : `<div class="cam center"><div class="browser ${frame ? "" : "clean-browser"}" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame ? chrome() : ""}<div class="viewport">${body}</div></div>${mark}</div>`;
+      const active = Math.max(BEAT, timing().span);
       const code = [
-        `tl.fromTo("#${id}-b",{y:${Math.round(H * 0.3)},rotate:${portrait ? 0 : -2}},{y:0,rotate:0,duration:.6,ease:"expo.out"},${r3(t0)});`,
-        `tl.fromTo("#${id}-img",{yPercent:0},{yPercent:-${portrait ? 45 : 55},duration:${CUT + 0.2},ease:"power2.inOut"},${r3(t0 + 0.1)});`,
-        `tl.fromTo("#${id}-anchor",{opacity:0,scale:.72},{opacity:1,scale:1,duration:.36,ease:"power2.out"},${r3(t0 + 0.12)});`,
+        `tl.fromTo("#${id}-b",{y:${Math.round(H * (frame ? 0.18 : 0.06))},rotate:${frame && !portrait ? -2 : 0}},{y:0,rotate:0,duration:${r3(Math.min(.6, active * .28))},ease:"expo.out"},${r3(t0)});`,
+        `tl.fromTo("#${id}-img",{yPercent:0},{yPercent:-${portrait ? 45 : 55},duration:${r3(Math.max(BEAT, active - Math.min(.35, active * .16)))},ease:"power2.inOut"},${r3(t0 + Math.min(.1, active * .08))});`,
       ];
-      const interaction = interactionCode(sc, id, t0, "scroll");
+      const interaction = interactionCode(sc, id, t0, "scroll", asset);
       return { html, code: [...code, ...interaction.code], hits: interaction.hits };
     },
     feature(sc, id, t0, idx) {
@@ -303,7 +464,7 @@ function sceneBuilders(ctx) {
       const lines = wrap(title, portrait ? 12 : 20).slice(0, 3);
       const fs = fitSize(lines, innerW * (portrait ? 1 : 0.78), S.ratio, Math.round(H * (portrait ? 0.085 : 0.12)));
       const numFs = Math.round(H * (portrait ? 0.22 : 0.42));
-      const html = `<div class="cam left feat"><div class="num disp" id="${id}-n" style="font-size:${numFs}px">${n}</div><div class="ftext">${sc.kicker ? kicker(id, sc.kicker) : ""}${lines.map((l, i) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}${sc.sub ? `<p class="sub" id="${id}-s" style="font-size:${Math.round(u * 2.6)}px">${esc(clip(sc.sub, 80))}</p>` : ""}</div><div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const html = `<div class="cam left feat"><div class="num disp" id="${id}-n" style="font-size:${numFs}px">${n}</div><div class="ftext">${sc.kicker ? kicker(id, sc.kicker) : ""}${lines.map((l, i) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}${sc.sub ? `<p class="sub" id="${id}-s" style="font-size:${Math.round(u * 2.6)}px">${esc(clip(sc.sub, 80))}</p>` : ""}</div></div>`;
       const code = [
         `tl.fromTo("#${id}-n",{yPercent:30,opacity:0},{yPercent:0,opacity:1,duration:.7,ease:"expo.out"},${r3(t0)});`,
         `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:.5,ease:"expo.out",stagger:.07},${r3(t0 + BEAT * 0.5)});`,
@@ -316,7 +477,7 @@ function sceneBuilders(ctx) {
     featureStack(sc, id, t0) {
       const items = (sc.items || brief.features || []).slice(0, 3).map((x) => up(clip(typeof x === "string" ? x : x.title, 26)));
       const fs = Math.round(Math.min(u * (portrait ? 6 : 6.2), innerW / (Math.max(8, ...items.map((s) => s.length)) * S.ratio * 0.72)));
-      const html = `<div class="cam center"><div class="chips">${items.map((t, i) => `<div class="chip" id="${id}-c${i}" style="font-size:${fs}px"><span class="tick">✓</span>${esc(t)}</div>`).join("")}</div><div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const html = `<div class="cam center"><div class="chips">${items.map((t, i) => `<div class="chip" id="${id}-c${i}" style="font-size:${fs}px"><span class="tick">✓</span>${esc(t)}</div>`).join("")}</div></div>`;
       const code = items.map((_, i) => `tl.fromTo("#${id}-c${i}",{y:${Math.round(H * 0.18)},opacity:0,rotate:${i % 2 ? 3 : -3}},{y:0,opacity:1,rotate:0,duration:.42,ease:"back.out(1.6)"},${r3(t0 + i * BEAT)});`);
       code.push(drift(id, t0, 0.03));
       return { html, code, hits: items.map((_, i) => ({ t: t0 + i * BEAT, sfx: "pop_a", gain: 0.45 })) };
@@ -327,7 +488,7 @@ function sceneBuilders(ctx) {
       const pre = m ? m[1] : "", num = m ? parseFloat(m[2].replace(/,/g, "")) : 0, post = m ? m[3] : raw;
       const dec = m && m[2].includes(".") ? (m[2].split(".")[1] || "").length : 0;
       const fs = Math.min(Math.round(H * (portrait ? 0.2 : 0.36)), Math.floor(innerW / (Math.max(3, raw.length) * S.ratio * 1.05)));
-      const html = `<div class="cam center"><div class="disp statv" style="font-size:${fs}px"><span>${esc(pre)}</span><span id="${id}-v">${m ? (0).toFixed(dec) : esc(raw)}</span><span class="acc">${esc(post)}</span></div><div class="statl" id="${id}-l" style="font-size:${Math.round(u * 3.4)}px">${esc(up(clip(sc.label || "", 48)))}</div><div class="bar"><i id="${id}-bar"></i></div><div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const html = `<div class="cam center"><div class="disp statv" style="font-size:${fs}px"><span>${esc(pre)}</span><span id="${id}-v">${m ? (0).toFixed(dec) : esc(raw)}</span><span class="acc">${esc(post)}</span></div><div class="statl" id="${id}-l" style="font-size:${Math.round(u * 3.4)}px">${esc(up(clip(sc.label || "", 48)))}</div><div class="bar"><i id="${id}-bar"></i></div></div>`;
       const code = [
         `tl.fromTo("#${id} .statv",{scale:.8,opacity:0},{scale:1,opacity:1,duration:.4,ease:"expo.out"},${r3(t0)});`,
         m ? `(function(){var o={v:0},el=document.getElementById("${id}-v");tl.fromTo(o,{v:0},{v:${num},duration:1.0,ease:"power3.out",onUpdate:function(){el.textContent=o.v.toLocaleString("en-US",{minimumFractionDigits:${dec},maximumFractionDigits:${dec}})}},${r3(t0 + 0.05)});})();` : "",
@@ -368,71 +529,83 @@ function sceneBuilders(ctx) {
       return { html, code };
     },
     split(sc, id, t0, idx) {
-      const src = sc.src || shot(sc.shot ?? idx);
+      const asset = assetFor(sc);
       const lines = wrap(up(clip(sc.text || brief.headline, 48)), portrait ? 14 : 12).slice(0, 4);
       const fs = fitSize(lines, portrait ? innerW : W * 0.36, S.ratio, Math.round(H * (portrait ? 0.07 : 0.1)));
-      const html = `<div class="cam splitw ${portrait ? "col" : ""}"><div class="stext">${lines.map((l) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}</div><div class="sframe" id="${id}-f">${src ? `<div class="shot" style="background-image:url('${src}')"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`}</div><div class="shared-anchor" id="${id}-anchor"><i></i></div></div>`;
+      const html = `<div class="cam splitw ${portrait ? "col" : ""}"><div class="stext">${lines.map((l) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}</div><div class="sframe" id="${id}-f">${asset?.url ? `<div class="shot" style="${assetStyle(asset)}"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`}</div>${targetMarkup(id, asset, sc, W, H, u)}</div>`;
+      const active = Math.max(BEAT, timing().span);
       const code = [
-        `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:.5,ease:"expo.out",stagger:.07},${r3(t0 + 0.02)});`,
-        `tl.fromTo("#${id}-f",{clipPath:"inset(0% 0% 100% 0% round 24px)"},{clipPath:"inset(0% 0% 0% 0% round 24px)",duration:.6,ease:"expo.inOut"},${r3(t0 + 0.05)});`,
-        `tl.fromTo("#${id}-f .shot",{scale:1.25},{scale:1.02,duration:${CUT + 0.3},ease:"power2.out"},${r3(t0 + 0.05)});`,
+        `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:${r3(Math.min(.5, active * .28))},ease:"expo.out",stagger:.07},${r3(t0 + 0.02)});`,
+        `tl.fromTo("#${id}-f",{clipPath:"inset(0% 0% 100% 0% round 24px)"},{clipPath:"inset(0% 0% 0% 0% round 24px)",duration:${r3(Math.min(.6, active * .34))},ease:"expo.inOut"},${r3(t0 + 0.05)});`,
+        asset?.url ? `tl.fromTo("#${id}-f .shot",{scale:1.16},{scale:1.01,duration:${r3(Math.max(BEAT, active - .1))},ease:"power2.out"},${r3(t0 + 0.05)});` : "",
       ];
       return { html, code };
     },
     cta(sc, id, t0) {
-      const line = up(clip(sc.text || "Try it free", 30));
+      const line = up(clip(sc.text || brief.cta || brief.tagline || brief.headline || "See what is possible", 30));
       const lines = wrap(line, portrait ? 12 : 22).slice(0, 2);
       const fs = fitSize(lines, innerW, S.ratio, Math.round(H * (portrait ? 0.1 : 0.14)));
-      const btn = clip(sc.button || "Get started", 22);
-      const html = `<div class="cam center">${lines.map((l) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}<div class="btnwrap"><div class="btn" id="${id}-btn" style="font-size:${Math.round(u * 3.2)}px">${esc(btn)} <span class="arr">→</span><i class="rip" id="${id}-rip"></i></div><div class="url2 mono" style="font-size:${Math.round(u * 2.2)}px">${esc(brief.domain || "")}</div></div><svg class="cursor" id="${id}-cur" viewBox="0 0 24 24" width="${Math.round(u * 6)}" height="${Math.round(u * 6)}"><path d="M4 2l16 9-7 2-3 7z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg></div>`;
+      const btn = clip(sc.button || brief.ctaLabel || brief.cta_text || `Explore ${brief.name || "the product"}`, 22);
+      const active = Math.max(BEAT, timing().span);
+      const showCursor = sc.cursor === true || sc.showCursor === true;
+      const cursor = showCursor ? `<svg class="cursor" id="${id}-cur" viewBox="0 0 24 24" width="${Math.round(u * 6)}" height="${Math.round(u * 6)}"><path d="M4 2l16 9-7 2-3 7z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg>` : "";
+      const html = `<div class="cam center">${lines.map((l) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}<div class="btnwrap"><div class="btn" id="${id}-btn" style="font-size:${Math.round(u * 3.2)}px">${esc(btn)} <span class="arr">→</span><i class="rip" id="${id}-rip"></i></div><div class="url2 mono" style="font-size:${Math.round(u * 2.2)}px">${esc(brief.domain || "")}</div></div>${cursor}</div>`;
       const code = [
-        `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:.5,ease:"expo.out",stagger:.07},${r3(t0)});`,
-        `tl.fromTo("#${id}-btn",{scale:.6,opacity:0},{scale:1,opacity:1,duration:.45,ease:"back.out(1.8)"},${r3(t0 + BEAT)});`,
-        `tl.fromTo("#${id}-cur",{x:${Math.round(W * 0.3)},y:${Math.round(H * 0.3)},opacity:0},{x:${Math.round(u * 2)},y:${Math.round(u * 2)},opacity:1,duration:.5,ease:"power3.inOut"},${r3(t0 + BEAT * 1.6)});`,
-        `tl.to("#${id}-btn",{scale:.92,duration:.08,ease:"power2.in"},${r3(t0 + BEAT * 3)});`,
-        `tl.to("#${id}-btn",{scale:1,duration:.4,ease:"elastic.out(1,.4)"},${r3(t0 + BEAT * 3 + 0.08)});`,
-        `tl.fromTo("#${id}-rip",{scale:0,opacity:.7},{scale:3.5,opacity:0,duration:.6,ease:"power2.out"},${r3(t0 + BEAT * 3)});`,
+        `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:${r3(Math.min(.5, active * .24))},ease:"expo.out",stagger:.07},${r3(t0)});`,
+        `tl.fromTo("#${id}-btn",{scale:.78,opacity:0},{scale:1,opacity:1,duration:${r3(Math.min(.45, active * .24))},ease:"back.out(1.45)"},${r3(t0 + Math.min(BEAT, active * .18))});`,
+        showCursor ? `tl.fromTo("#${id}-cur",{x:${Math.round(W * 0.3)},y:${Math.round(H * 0.3)},opacity:0},{x:${Math.round(u * 2)},y:${Math.round(u * 2)},opacity:1,duration:${r3(Math.min(.5, active * .28))},ease:"power3.inOut"},${r3(t0 + Math.min(BEAT * 1.6, active * .54))});` : "",
+        `tl.to("#${id}-btn",{scale:.94,duration:.08,ease:"power2.in"},${r3(t0 + Math.max(BEAT, active - BEAT * 0.9))});`,
+        `tl.to("#${id}-btn",{scale:1,duration:${r3(Math.min(.32, active * .18))},ease:"power2.out"},${r3(t0 + Math.max(BEAT, active - BEAT * 0.82))});`,
+        `tl.fromTo("#${id}-rip",{scale:0,opacity:.45},{scale:2.8,opacity:0,duration:${r3(Math.min(.6, active * .32))},ease:"power2.out"},${r3(t0 + Math.max(BEAT, active - BEAT * 0.9))});`,
       ];
-      return { html, code, hits: [{ t: t0 + BEAT * 3, sfx: "mouse_click_b", gain: 0.7 }] };
+      return { html, code, hits: [{ t: t0 + Math.max(BEAT, active - BEAT * 0.9), sfx: "mouse_click_b", gain: 0.5 }] };
     },
     endcard(sc, id, t0, idx, isLast, total) {
       const name = brief.name || "Snapmy.site";
-      const logo = brief.logo;
+      const logoAsset = assetInfo(brief.logo, 0, "logo");
+      const logo = logoAsset?.url || brief.logo;
       const fs = Math.min(Math.round(H * (portrait ? 0.1 : 0.14)), Math.floor(innerW / (name.length * S.ratio)));
-      const la = brief.logoAspect || 0;
+      const la = brief.logoAspect || (logoAsset?.width && logoAsset?.height ? logoAsset.width / logoAsset.height : 0);
       const wordmark = logo && la >= 1.8;
       const tint = S.dark ? "brightness(0) invert(1)" : "brightness(0)";
-      const mark = wordmark ? `<img class="logo wm" id="${id}-m" src="${logo}" alt="" style="height:${Math.round(Math.min(fs * 1.2, (innerW * 0.6) / la))}px;max-width:${Math.round(innerW * 0.6)}px;filter:${tint}">`
-        : logo && la > 0 ? `<div class="plate" id="${id}-m" style="width:${Math.round(fs * 1.15)}px;height:${Math.round(fs * 1.15)}px"><img src="${logo}" alt=""></div>`
+      const mark = wordmark ? `<img class="logo wm" id="${id}-m" src="${esc(logo)}" alt="" style="height:${Math.round(Math.min(fs * 1.2, (innerW * 0.6) / la))}px;max-width:${Math.round(innerW * 0.6)}px;filter:${tint}">`
+        : logo && la > 0 ? `<div class="plate" id="${id}-m" style="width:${Math.round(fs * 1.15)}px;height:${Math.round(fs * 1.15)}px"><img src="${esc(logo)}" alt=""></div>`
         : `<div class="mark" id="${id}-m" style="width:${Math.round(fs * 1.1)}px;height:${Math.round(fs * 1.1)}px;font-size:${Math.round(fs * 0.6)}px">${esc(name[0] || "C")}</div>`;
-      const html = `<div class="cam center"><div class="lockup">${mark}<div class="disp nm" id="${id}-nm" style="font-size:${fs}px;${wordmark ? "display:none" : ""}">${esc(name)}</div></div><div class="tagl" id="${id}-t" style="font-size:${Math.round(u * 2.8)}px">${esc(clip(sc.text || brief.tagline || brief.domain, 60))}</div><div class="url2 mono" id="${id}-u" style="font-size:${Math.round(u * 2.2)}px">${esc(brief.domain || "")}</div><div class="sweep" id="${id}-sw"></div></div>`;
+      const active = Math.max(BEAT * 4, timing().span);
+      const html = `<div class="cam center"><div class="lockup">${mark}<div class="disp nm" id="${id}-nm" style="font-size:${fs}px;${wordmark ? "display:none" : ""}">${esc(name)}</div></div><div class="tagl" id="${id}-t" style="font-size:${Math.round(u * 2.8)}px">${esc(clip(sc.text || brief.tagline || brief.headline || brief.domain, 60))}</div><div class="url2 mono" id="${id}-u" style="font-size:${Math.round(u * 2.2)}px">${esc(brief.domain || "")}</div><div class="sweep" id="${id}-sw"></div></div>`;
       const end = total;
       const code = [
-        `tl.fromTo("#${id}-m",{scale:0,rotate:-30},{scale:1,rotate:0,duration:.6,ease:"back.out(1.7)"},${r3(t0)});`,
-        `tl.fromTo("#${id}-nm",{scale:1.25,opacity:0,filter:"blur(12px)"},{scale:1,opacity:1,filter:"blur(0px)",duration:.8,ease:"expo.out"},${r3(t0 + 0.08)});`,
-        `tl.fromTo("#${id}-t",{opacity:0,y:18},{opacity:.85,y:0,duration:.5,ease:"power3.out"},${r3(t0 + BEAT * 2)});`,
-        `tl.fromTo("#${id}-u",{opacity:0},{opacity:.6,duration:.5},${r3(t0 + BEAT * 2.5)});`,
-        `tl.fromTo("#${id}-sw",{xPercent:-150},{xPercent:150,duration:1.2,ease:"power2.inOut"},${r3(t0 + 0.3)});`,
-        `tl.to("#${id} .cam",{opacity:0,scale:.97,duration:.5,ease:"power2.in"},${r3(end - 0.5)});`,
+        `tl.fromTo("#${id}-m",{scale:.84,rotate:-8,opacity:0},{scale:1,rotate:0,opacity:1,duration:${r3(Math.min(.6, active * .24))},ease:"power2.out"},${r3(t0)});`,
+        `tl.fromTo("#${id}-nm",{scale:1.08,opacity:0,filter:"blur(5px)"},{scale:1,opacity:1,filter:"blur(0px)",duration:${r3(Math.min(.8, active * .34))},ease:"power2.out"},${r3(t0 + 0.08)});`,
+        `tl.fromTo("#${id}-t",{opacity:0,y:18},{opacity:.85,y:0,duration:${r3(Math.min(.5, active * .22))},ease:"power3.out"},${r3(t0 + Math.min(BEAT * 2, active * .52))});`,
+        `tl.fromTo("#${id}-u",{opacity:0},{opacity:.6,duration:${r3(Math.min(.5, active * .22))}},${r3(t0 + Math.min(BEAT * 2.5, active * .66))});`,
+        treatment.glare ? `tl.fromTo("#${id}-sw",{xPercent:-150},{xPercent:150,duration:${r3(Math.min(1.2, active * .5))},ease:"power2.inOut"},${r3(t0 + .3)});` : "",
+        `tl.to("#${id} .cam",{opacity:0,scale:.985,duration:${r3(Math.min(.5, active * .22))},ease:"power2.in"},${r3(Math.max(t0 + BEAT, end - .5))});`,
       ];
-      return { html, code, hits: [{ t: t0, sfx: "boom", gain: 0.9 }, { t: t0, sfx: "crash", gain: 0.35 }] };
+      return { html, code, hits: [{ t: t0, sfx: "boom", gain: 0.55 }] };
     },
   };
 }
 
 /* ---------------- transition planner ---------------- */
-function planTransitions(scenes, S, rand, motion = {}) {
+function planTransitions(scenes, S, rand, motion = {}, treatment = {}) {
   const out = [null];
   for (let i = 1; i < scenes.length; i++) {
     const prev = scenes[i - 1].type, cur = scenes[i].type;
+    const prevIntent = scenes[i - 1].motionIntent || scenes[i - 1].motion?.intent;
+    const intent = scenes[i].motionIntent || scenes[i].motion?.intent;
     let k = motion.primary || S.primary;
     if (scenes[i].transition && ["whip", "zoom", "flash", "wipe", "iris", "push", "glitch", "blocks", "cut"].includes(scenes[i].transition)) k = scenes[i].transition;
     else if (cur === "flashword") k = "cut";
-    else if (cur === "screen" && !scenes.slice(0, i).some((s) => s.type === "screen")) k = (motion.accents || S.accents).includes("flash") ? "flash" : "zoom"; // hero reveal: boldest
-    else if (cur === "endcard") k = S.dark ? "zoom" : "iris";
-    else if ((cur === "stat" || cur === "quote" || cur === "logos") && prev !== cur) k = "blocks";
-    else if (rand.next() < 0.3) k = rand.pick((motion.accents || S.accents).filter((a) => a !== "blocks"));
-    if (k === out[i - 1] && k !== (motion.primary || S.primary) && rand.next() < 0.7) k = motion.primary || S.primary;
+    else if (cur === "screen" && prev !== "screen") k = intent === "focus" ? "push" : "cut";
+    else if (cur === "endcard") k = "cut";
+    else if (cur === "quote" || cur === "logos") k = "cut";
+    else if (intent === "impact" || intent === "commit") k = treatment.flash ? "flash" : "cut";
+    else if (intent === "glide" || prevIntent === "glide") k = "wipe";
+    else if (prev === "screen" && cur === "feature") k = "push";
+    else if (rand.next() < 0.18) { const accents = (motion.accents || S.accents).filter((a) => a !== "blocks" && (a !== "glitch" || treatment.glitch) && (a !== "flash" || treatment.flash)); if (accents.length) k = rand.pick(accents); }
+    if (["glitch", "blocks"].includes(k) && !treatment[k]) k = "cut";
+    if (k === out[i - 1]) k = "cut";
     out.push(k);
   }
   return out;
@@ -440,38 +613,50 @@ function planTransitions(scenes, S, rand, motion = {}) {
 
 function planWindowGroups(scenes) {
   const groups = [];
+  const isWindowScene = (scene) => WINDOW_SCENE_TYPES.has(scene.type) && Boolean(scene.asset?.url);
   for (let i = 0; i < scenes.length;) {
-    if (!WINDOW_SCENE_TYPES.has(scenes[i].type)) { i++; continue; }
+    if (!isWindowScene(scenes[i])) { i++; continue; }
     const start = i;
-    while (i + 1 < scenes.length && WINDOW_SCENE_TYPES.has(scenes[i + 1].type) && i - start < 3) i++;
+    while (i + 1 < scenes.length && isWindowScene(scenes[i + 1]) && i - start < 3) i++;
     groups.push({ start, end: i });
     i++;
   }
   return groups;
 }
 
-function waypointFor(index, W, motion = {}) {
+function waypointFor(index, W, motion = {}, asset = null, scene = {}, total = 1) {
   const scale = W / 1920;
-  const p = WINDOW_WAYPOINTS[index % WINDOW_WAYPOINTS.length];
+  const fp = focalPoint(asset, { x: 0.5, y: 0.5 });
+  const role = asset?.role || scene.type || "visual";
+  const progress = total <= 1 ? 0 : index / (total - 1);
   const pan = motion.pan || 1, depth = motion.depth || 1;
-  const wave = index === 0 ? 0 : Math.sin(index * 1.7) * 28 * pan;
   const camera = motion.camera || "linear";
-  const x = p[0] * pan + (camera === "orbit" ? wave : camera === "drift" ? wave * 0.45 : 0);
-  const y = p[1] * pan + (camera === "orbit" ? Math.cos(index * 1.35) * 24 * pan : camera === "drift" ? wave * 0.35 : 0);
-  const z = p[2] * depth;
+  const biasX = role === "workflow" || role === "result" ? 0.12 : role === "proof" ? -0.1 : 0;
+  const biasY = role === "hero" ? -0.08 : role === "proof" ? 0.1 : 0;
+  const arc = camera === "orbit" ? Math.sin(progress * Math.PI) : camera === "drift" ? Math.sin(progress * Math.PI * 0.85) * 0.45 : camera === "snap" ? (index ? 0.6 : 0) : progress * 0.25;
+  const x = ((0.5 - fp.x) * 760 + biasX * 420 + arc * 110) * pan;
+  const y = ((0.5 - fp.y) * 500 + biasY * 300 + Math.cos(progress * Math.PI) * (camera === "orbit" ? 42 : 14)) * pan;
+  const z = (-240 - (role === "hero" ? 70 : role === "workflow" ? 130 : 0) - progress * 180) * depth;
   return {
     x: Math.round(x * scale), y: Math.round(y * scale), z: Math.round(z * scale),
-    scale: (index % 3 === 1 ? 1.08 : index % 3 === 2 ? 1.03 : 1) * (camera === "snap" && index > 0 ? 1.02 : 1),
-    rx: Math.round((index === 0 ? 0 : (index % 2 ? 1 : -1) * (motion.tilt || 0)) * 10) / 10,
-    ry: Math.round((index === 0 ? 0 : (index % 3 - 1) * (motion.tilt || 0.4)) * 10) / 10,
+    scale: r3(1 + (role === "result" ? 0.045 : role === "hero" ? 0.025 : 0.012) + (camera === "snap" ? 0.012 : 0)),
+    rx: Math.round((index ? (motion.tilt || 0) * (0.35 + progress * 0.35) : 0) * 10) / 10,
+    ry: Math.round((index ? ((fp.x - 0.5) * 2 + (camera === "orbit" ? Math.sin(progress * Math.PI) : 0)) * (motion.tilt || 0.3) : 0) * 10) / 10,
   };
 }
 
-function anchorCode(previousId, nextId, t) {
-  const at = r3(t - 0.24);
+function shotMotionCode(id, t0, timing, spec) {
+  const dir = spec.direction || 1;
+  const anticipation = Math.max(0.04, spec.anticipation || 0.08);
+  const follow = Math.min(spec.followThrough || timing.followThrough || 0.16, Math.max(0.08, timing.span * 0.24));
+  const prepAt = Math.max(0, t0 - anticipation * 0.45);
+  const settleAt = Math.max(t0 + anticipation, t0 + timing.span - follow);
+  const offset = 9 + Math.round((spec.intent === "impact" ? 5 : 0));
+  const tilt = r3((spec.tilt || 0) * 0.12);
   return [
-    `tl.fromTo("#${previousId}-anchor",{opacity:1,scale:1},{opacity:0,scale:1.65,duration:.28,ease:"power2.in"},${at});`,
-    `tl.fromTo("#${nextId}-anchor",{opacity:0,scale:.58,filter:"blur(5px)"},{opacity:1,scale:1,filter:"blur(0px)",duration:.42,ease:"power2.out"},${at});`,
+    `tl.fromTo("#${id}-motion",{x:${-dir * offset},y:${dir * 3},scale:${r3(1 - (spec.overshoot || 0.025))},rotate:${-tilt}},{x:0,y:0,scale:1,rotate:0,duration:${r3(anticipation)},ease:"power3.out"},${r3(prepAt)});`,
+    `tl.to("#${id}-motion",{x:${dir * Math.round(offset * (spec.overshoot ? 0.5 : 0.28))},y:${-dir * 2},scale:${r3(1 + (spec.overshoot || 0.025))},rotate:${tilt},duration:${r3(follow * 0.58)},ease:"power2.out"},${r3(settleAt)});`,
+    `tl.to("#${id}-motion",{x:0,y:0,scale:1,rotate:0,duration:${r3(Math.max(0.08, follow * 0.42))},ease:"sine.out"},${r3(settleAt + follow * 0.58)});`,
   ];
 }
 
@@ -480,24 +665,26 @@ export function fallbackPlan(brief, decisions = {}) {
   const f = (brief.features || []).map((x) => (typeof x === "string" ? { title: x } : x)).filter((x) => x.title);
   const stats = (brief.stats || []).filter((s) => s.value);
   const quotes = (brief.quotes || []).filter((q) => q.text);
-  const hook = (decisions.hook || brief.hookCandidates?.[0] || brief.headline || brief.name).split(/\s+/).slice(0, 4);
+  const assets = collectAssets(brief);
+  const hasFullpage = assets.some((a) => a.fullPage);
+  const hook = String(decisions.hook || brief.hookCandidates?.[0] || brief.headline || brief.name).split(/\s+/).filter(Boolean).slice(0, 4);
+  const mode = hash(`${brief.domain || brief.name || "product"}:${decisions.style || "kinetic"}`) % 3;
   const S = [];
   S.push({ type: "coldopen", word: brief.name });
-  S.push({ type: "hook", words: hook });
-  S.push({ type: "statement", text: brief.description || brief.headline, kicker: "The problem", accent: "" });
-  S.push({ type: "flashword", word: (brief.headline || brief.name).split(/\s+/).sort((a, b) => b.length - a.length)[0] });
-  S.push({ type: "screen", shot: 0, caption: clip(brief.headline, 34) });
-  f.slice(0, 2).forEach((x, i) => S.push({ type: "feature", title: x.title, sub: x.desc, index: i }));
-  S.push({ type: "scroll", shot: 1 });
-  if (f[2]) S.push({ type: "feature", title: f[2].title, sub: f[2].desc, index: 2 });
-  if (f.length >= 3) S.push({ type: "featureStack", items: f.slice(3, 6).length === 3 ? f.slice(3, 6).map((x) => x.title) : f.slice(0, 3).map((x) => x.title) });
-  stats.slice(0, 2).forEach((s) => S.push({ type: "stat", value: s.value, label: s.label }));
-  if (quotes[0]) S.push({ type: "quote", text: quotes[0].text, author: quotes[0].author });
-  if ((brief.logos || []).length >= 3) S.push({ type: "logos", names: brief.logos.slice(0, 6) });
-  S.push({ type: "marquee", text: brief.name });
-  S.push({ type: "split", shot: 2, text: brief.headline });
-  S.push({ type: "cta", text: "Try it today", button: "Get started" });
-  S.push({ type: "endcard", text: brief.headline });
+  if (mode !== 2) S.push({ type: "hook", words: hook, motionIntent: "staccato" });
+  if (brief.description || brief.headline) S.push({ type: "statement", text: brief.description || brief.headline, kicker: brief.category || "", accent: "" });
+  if (mode === 1 && brief.headline) S.push({ type: "flashword", word: brief.headline.split(/\s+/).sort((a, b) => b.length - a.length)[0], motionIntent: "impact" });
+  if (assets.length) S.push({ type: "screen", asset: assets[0], caption: clip(brief.headline, 34), motionIntent: "focus" });
+  f.slice(0, mode === 0 ? 2 : 3).forEach((x, i) => S.push({ type: "feature", title: x.title, sub: x.desc, index: i, motionIntent: i % 2 ? "clarify" : "reveal" }));
+  if (hasFullpage) S.push({ type: "scroll", asset: assets.find((a) => a.fullPage), motionIntent: "scan" });
+  else if (assets.length > 1) S.push({ type: "split", asset: assets[1], text: brief.headline, motionIntent: "compare" });
+  if (f.length >= 3 && mode === 2) S.push({ type: "featureStack", items: f.slice(0, 3).map((x) => x.title), motionIntent: "cascade" });
+  if (stats.length) S.push({ type: "stat", value: stats[0].value, label: stats[0].label, motionIntent: "count" });
+  if (quotes[0] && mode !== 0) S.push({ type: "quote", text: quotes[0].text, author: quotes[0].author, motionIntent: "settle" });
+  if ((brief.logos || []).length >= 3 && mode === 0) S.push({ type: "logos", names: brief.logos.slice(0, 6), motionIntent: "assemble" });
+  if (mode === 1 && brief.name) S.push({ type: "marquee", text: brief.name, duration: 1.125, motionIntent: "glide" });
+  S.push({ type: "cta", text: brief.cta || brief.tagline || brief.headline, button: brief.ctaLabel || brief.cta_text, motionIntent: "commit" });
+  S.push({ type: "endcard", text: brief.tagline || brief.headline, motionIntent: "land" });
   return { style: decisions.style || "kinetic", motionVariation: decisions.motionVariation || decisions.motion_variation || decisions.motion?.variation, scenes: S.slice(0, 24), panel: [] };
 }
 
@@ -512,15 +699,26 @@ export function compose(brief, plan, opts = {}) {
   const P = palette(brief, S);
   const rand = rng(hash((brief.domain || "") + styleKey + (opts.seed || 0)));
   const u = Math.min(W, H) / 100;
+  const treatment = effectPolicy(brief, plan, motion, S);
+  const assetPool = collectAssets(brief);
   let scenes = (plan.scenes || []).filter((s) => SCENE_TYPES.includes(s.type));
-  if (!scenes.length) scenes = fallbackPlan(brief).scenes;
+  if (!scenes.length) scenes = fallbackPlan(brief, { style: styleKey, motionVariation: motion.id }).scenes;
   if (scenes[scenes.length - 1].type !== "endcard") scenes.push({ type: "endcard" });
   { let k = 0; scenes = scenes.map((s) => (s.type === "feature" ? { ...s, ordinal: k++ } : s)); }
+  scenes = assignAssets(scenes, assetPool).map((scene) => {
+    if (["screen", "scroll", "split"].includes(scene.type) && !scene.asset) {
+      return { ...scene, type: "statement", text: scene.text || brief.headline || brief.description || brief.name, kicker: scene.kicker || "", motionIntent: scene.motionIntent || "clarify" };
+    }
+    return scene;
+  });
   const N = scenes.length;
-  const duration = N * CUT + 0.6; // tail for the end card to breathe
-  const ctx = { W, H, P, S, brief, u, portrait, dir: 1, motion };
+  const timings = [];
+  let cursor = 0;
+  scenes.forEach((scene, i) => { const timing = shotTiming(scene, i, rand); const t = cursor; timings.push({ ...timing, t, end: t + timing.span }); cursor += timing.span; });
+  const duration = r3(cursor + 0.42); // a small breathing tail after the last hold
+  const ctx = { W, H, P, S, brief, u, portrait, dir: 1, motion, treatment };
   const B = sceneBuilders(ctx);
-  const trans = planTransitions(scenes, S, rand, motion);
+  const trans = planTransitions(scenes, S, rand, motion, treatment);
   const windowGroups = planWindowGroups(scenes);
   const windowGroupAt = new Map();
   windowGroups.forEach((g) => { for (let i = g.start; i <= g.end; i++) windowGroupAt.set(i, g); });
@@ -531,7 +729,7 @@ export function compose(brief, plan, opts = {}) {
   const OV = 0.3; // overlap around each cut for transitions
   let windowGroupIndex = 0;
   scenes.forEach((sc, i) => {
-    const id = `s${i}`; const t0 = i * CUT;
+    const id = `s${i}`; const shotPlan = timings[i]; const t0 = shotPlan.t;
     const isLast = i === N - 1;
     const LEAD = { whip: 0.02, zoom: 0.04, flash: 0, wipe: 0.18, iris: 0.2, push: 0.2, glitch: 0.03, blocks: 0, cut: 0 };
     const group = windowGroupAt.get(i);
@@ -540,8 +738,8 @@ export function compose(brief, plan, opts = {}) {
       if (i !== group.start) return;
       const gid = `wg${windowGroupIndex++}`;
       const groupParts = [];
-      const groupStart = group.start * CUT;
-      const groupEnd = group.end === N - 1 ? duration : (group.end + 1) * CUT + OV;
+      const groupStart = timings[group.start].t;
+      const groupEnd = group.end === N - 1 ? duration : timings[group.end].end + OV;
       const fw = portrait ? W * 0.9 : W * 0.74;
       const fh = fw * (portrait ? 1.25 : 0.6);
 
@@ -549,15 +747,17 @@ export function compose(brief, plan, opts = {}) {
       for (let j = group.start; j <= group.end; j++) {
         const member = scenes[j];
         const memberId = `s${j}`;
-        const memberT = j * CUT;
+        const memberTiming = timings[j];
+        const memberT = memberTiming.t;
+        ctx.timing = memberTiming;
+        ctx.motionSpec = shotMotion(member, j, member.type, motion, rand);
         const built = B[member.type](member, memberId, memberT, j, j === N - 1, duration);
-        const wp = waypointFor(j - group.start, W, motion);
-        groupParts.push(`<div id="${memberId}" class="window-shot" style="--wx:${wp.x}px;--wy:${wp.y}px;--wz:${wp.z}px;--ws:${wp.scale};opacity:${j === group.start ? 1 : 0}"><div class="sc" id="${memberId}-sc">${built.html}</div></div>`);
-        code.push(`// ${j} ${member.type} · persistent window`, ...built.code.filter(Boolean));
+        const wp = waypointFor(j - group.start, W, motion, member.asset, member, group.end - group.start + 1);
+        groupParts.push(`<div id="${memberId}" class="window-shot" data-motion-intent="${esc(ctx.motionSpec.intent)}" style="--wx:${wp.x}px;--wy:${wp.y}px;--wz:${wp.z}px;--ws:${wp.scale};opacity:${j === group.start ? 1 : 0}"><div class="sc" id="${memberId}-sc"><div class="motion-stage" id="${memberId}-motion">${built.html}</div></div></div>`);
+        code.push(`// ${j} ${member.type} · persistent window`, ...built.code.filter(Boolean), ...shotMotionCode(memberId, memberT, memberTiming, ctx.motionSpec));
         (built.hits || []).forEach((h) => cues.push({ ...h, scene: j }));
-        sceneMeta.push({ i: j, type: member.type, t: memberT, transition: j === group.start ? trans[j] : "camera", label: sceneLabel(member) });
+        sceneMeta.push({ i: j, type: member.type, t: memberT, duration: memberTiming.span, hold: memberTiming.hold, asset: member.asset?.id || null, motion: ctx.motionSpec.intent, transition: j === group.start ? trans[j] : "camera", label: sceneLabel(member) });
         if (j > group.start) {
-          code.push(...anchorCode(`s${j - 1}`, memberId, memberT));
           cues.push({ t: memberT, gain: 0.62, scene: j, transition: "camera", bridge: true });
         }
       }
@@ -566,22 +766,23 @@ export function compose(brief, plan, opts = {}) {
       const start = group.start === 0 ? 0 : Math.max(0, groupStart - (LEAD[trans[group.start]] ?? 0));
       const rigId = windowGroupIndex === 1 ? "camera-rig" : `${gid}-camera-rig`;
       const shots = group.end - group.start + 1;
-      html += `<section id="${gid}" class="clip window-group" data-window-shots="${shots}" data-start="${r3(start)}" data-duration="${r3(groupEnd - start)}" data-track-index="1" style="z-index:${10 + group.start}"><div class="window-rig camera-rig" id="${rigId}"><div class="browser" id="${gid}-browser" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px"><div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span><span class="window-count mono">${shots} beats</span></div><div class="window-stage"><div class="window-camera" id="${gid}-camera"><div class="window-world" id="${gid}-world">${groupParts.join("")}</div></div><div class="glare"></div></div></div></div></section>\n`;
+      const frame = treatment.chrome ? `<div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>` : "";
+      html += `<section id="${gid}" class="clip window-group" data-window-shots="${shots}" data-start="${r3(start)}" data-duration="${r3(groupEnd - start)}" data-track-index="1" style="z-index:${10 + group.start}"><div class="window-rig camera-rig" id="${rigId}"><div class="browser ${treatment.chrome ? "" : "clean-browser"}" id="${gid}-browser" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame}${treatment.chrome ? `<span class="window-count mono">${shots} views</span>` : ""}<div class="window-stage"><div class="window-camera" id="${gid}-camera"><div class="window-world" id="${gid}-world">${groupParts.join("")}</div></div>${treatment.glare ? `<div class="glare"></div>` : ""}</div></div></div></section>\n`;
 
-      const first = waypointFor(0, W, motion);
+      const first = waypointFor(0, W, motion, scenes[group.start].asset, scenes[group.start], shots);
       code.push(`tl.set("#${gid}-camera",{x:${-first.x},y:${-first.y},z:${first.z},rotationX:${first.rx},rotationY:${first.ry}},${r3(groupStart)});`);
       for (let j = group.start + 1; j <= group.end; j++) {
-        const wp = waypointFor(j - group.start, W, motion);
-        const moveAt = j * CUT - CUT;
-        const revealAt = j * CUT - 0.28;
-        // A linear master-camera segment preserves velocity at every internal boundary.
-        code.push(`tl.to("#${gid}-camera",{x:${-wp.x},y:${-wp.y},z:${wp.z},rotationX:${wp.rx},rotationY:${wp.ry},duration:${CUT},ease:"none"},${r3(moveAt)});`);
-        code.push(`tl.fromTo("#s${j}",{opacity:0,scale:.94},{opacity:1,scale:1,duration:.28,ease:"power2.out"},${r3(revealAt)});`);
-        code.push(`tl.to("#s${j - 1}",{opacity:0,duration:.24,ease:"power2.in"},${r3(revealAt + 0.05)});`);
+        const wp = waypointFor(j - group.start, W, motion, scenes[j].asset, scenes[j], shots);
+        const moveAt = timings[j - 1].t;
+        const moveDuration = Math.max(BEAT, timings[j].t - timings[j - 1].t);
+        const revealAt = timings[j].t - Math.min(.28, timings[j].span * .18);
+        code.push(`tl.to("#${gid}-camera",{x:${-wp.x},y:${-wp.y},z:${wp.z},rotationX:${wp.rx},rotationY:${wp.ry},duration:${r3(moveDuration)},ease:"power2.inOut"},${r3(moveAt)});`);
+        code.push(`tl.fromTo("#s${j}",{opacity:0,scale:.97},{opacity:1,scale:1,duration:${r3(Math.min(.28, timings[j].span * .18))},ease:"power2.out"},${r3(revealAt)});`);
+        code.push(`tl.to("#s${j - 1}",{opacity:0,duration:${r3(Math.min(.24, timings[j - 1].span * .16))},ease:"power2.in"},${r3(revealAt + .05)});`);
       }
       if (group.end > group.start) {
-        const last = waypointFor(group.end - group.start, W, motion);
-        code.push(`tl.to("#${gid}-camera",{x:${-last.x},y:${-last.y},z:${last.z},rotationX:${last.rx},rotationY:${last.ry},duration:${motion.settle},ease:"power2.out"},${r3((group.end + 1) * CUT)});`);
+        const last = waypointFor(group.end - group.start, W, motion, scenes[group.end].asset, scenes[group.end], shots);
+        code.push(`tl.to("#${gid}-camera",{x:${-last.x},y:${-last.y},z:${last.z},rotationX:${last.rx},rotationY:${last.ry},duration:${r3(Math.min(motion.settle, timings[group.end].span * .25))},ease:"power2.out"},${r3(timings[group.end].end)});`);
       }
       if (group.start > 0) {
         ctx.dir = group.start % 2 ? 1 : -1;
@@ -593,11 +794,13 @@ export function compose(brief, plan, opts = {}) {
     }
 
     const start = i === 0 ? 0 : Math.max(0, t0 - (LEAD[trans[i]] ?? 0));
-    const end = isLast ? duration : t0 + CUT + OV;
+    const end = isLast ? duration : shotPlan.end + OV;
     ctx.windowed = false;
+    ctx.timing = shotPlan;
+    ctx.motionSpec = shotMotion(sc, i, sc.type, motion, rand);
     const built = B[sc.type](sc, id, t0, i, isLast, duration);
-    html += `<section id="${id}" class="clip scene t-${sc.type}" data-start="${r3(start)}" data-duration="${r3(end - start)}" data-track-index="${1 + (i % 2)}" style="z-index:${10 + i}"><div class="sc" id="${id}-sc"><div class="ground"></div>${built.html}</div></section>\n`;
-    code.push(`// ${i} ${sc.type}`, ...built.code.filter(Boolean));
+    html += `<section id="${id}" class="clip scene t-${sc.type}" data-start="${r3(start)}" data-duration="${r3(end - start)}" data-shot-duration="${r3(shotPlan.span)}" data-hold="${r3(shotPlan.hold)}" data-motion-intent="${esc(ctx.motionSpec.intent)}" data-track-index="${1 + (i % 2)}" style="z-index:${10 + i}"><div class="sc" id="${id}-sc"><div class="ground"></div><div class="motion-stage" id="${id}-motion">${built.html}</div></div></section>\n`;
+    code.push(`// ${i} ${sc.type}`, ...built.code.filter(Boolean), ...shotMotionCode(id, t0, shotPlan, ctx.motionSpec));
     (built.hits || []).forEach((h) => cues.push({ ...h, scene: i }));
     if (i > 0) {
       ctx.dir = i % 2 ? 1 : -1;
@@ -605,21 +808,20 @@ export function compose(brief, plan, opts = {}) {
       code.push(...transitionCode(k, `#s${i - 1}-sc`, `#${id}-sc`, t0, ctx));
       if (TRANSITION_SFX[k]) cues.push({ t: t0 - 0.12, sfx: TRANSITION_SFX[k], gain: 0.5, scene: i, transition: k });
     }
-    sceneMeta.push({ i, type: sc.type, t: t0, transition: trans[i], label: sceneLabel(sc) });
+    sceneMeta.push({ i, type: sc.type, t: t0, duration: shotPlan.span, hold: shotPlan.hold, asset: sc.asset?.id || null, motion: ctx.motionSpec.intent, transition: trans[i], label: sceneLabel(sc) });
   });
 
-  // film grain flicker (deterministic, 12 fps steps)
   const grainSteps = [];
-  for (let t = 0; t < duration; t += 1 / 12) grainSteps.push(`tl.set("#fx-grain",{backgroundPosition:"${Math.floor(rand.next() * 200)}px ${Math.floor(rand.next() * 200)}px"},${r3(t)});`);
+  if (treatment.grain > 0) for (let t = 0; t < duration; t += 1 / 12) grainSteps.push(`tl.set("#fx-grain",{backgroundPosition:"${Math.floor(rand.next() * 200)}px ${Math.floor(rand.next() * 200)}px"},${r3(t)});`);
   // HUD progress
-  const hud = S.hud ? `<div id="hud" class="clip" data-start="0" data-duration="${r3(duration)}" data-track-index="5"><div class="hud-in mono"><span class="rec"></span><span>${esc((brief.name || "").toUpperCase())}</span><span class="sp"></span><span id="hud-n">01/${String(N).padStart(2, "0")}</span></div><div class="hud-bar"><i id="hud-p"></i></div></div>` : "";
-  const hudCode = S.hud ? [`tl.fromTo("#hud-p",{scaleX:0},{scaleX:1,duration:${r3(N * CUT)},ease:"none"},0);`, `(function(){var hp={v:0},el=document.getElementById("hud-n");tl.fromTo(hp,{v:0},{v:${N},duration:${r3(N * CUT)},ease:"none",onUpdate:function(){var k=Math.min(${N},Math.floor(hp.v)+1);el.textContent=(k<10?"0":"")+k+"/${String(N).padStart(2, "0")}"}},0);})();`, `tl.to("#hud",{opacity:0,duration:.4},${r3((N - 1) * CUT)});`] : [];
+  const hud = treatment.hud ? `<div id="hud" class="clip" data-start="0" data-duration="${r3(duration)}" data-track-index="5"><div class="hud-in mono"><span class="rec"></span><span>${esc((brief.name || "").toUpperCase())}</span><span class="sp"></span><span id="hud-n">01/${String(N).padStart(2, "0")}</span></div><div class="hud-bar"><i id="hud-p"></i></div></div>` : "";
+  const hudCode = treatment.hud ? [`tl.fromTo("#hud-p",{scaleX:0},{scaleX:1,duration:${r3(duration)},ease:"none"},0);`, `(function(){var hp={v:0},el=document.getElementById("hud-n");tl.fromTo(hp,{v:0},{v:${N},duration:${r3(duration)},ease:"none",onUpdate:function(){var k=Math.min(${N},Math.floor(hp.v)+1);el.textContent=(k<10?"0":"")+k+"/${String(N).padStart(2, "0")}"}},0);})();`, `tl.to("#hud",{opacity:0,duration:.4},${r3(Math.max(0, duration - .5))});`] : [];
 
-  const blocks = Array(7).fill("<i></i>").join("");
+  const blocks = treatment.blocks ? Array(7).fill("<i></i>").join("") : "";
   const fontsHref = `https://fonts.googleapis.com/css2?family=${S.fonts}&display=block`;
-  const audioTag = opts.audioSrc ? `<audio id="score" data-start="0" data-duration="${r3(duration)}" data-track-index="9" data-volume="1" src="${opts.audioSrc}"></audio>` : "";
+  const audioTag = opts.audioSrc ? `<audio id="score" data-start="0" data-duration="${r3(duration)}" data-track-index="9" data-volume="1" src="${esc(opts.audioSrc)}"></audio>` : "";
 
-  const css = buildCSS({ W, H, P, S, u, portrait, grain: S.grain, motion });
+  const css = buildCSS({ W, H, P, S, u, portrait, grain: treatment.grain, motion, treatment });
   const doc = `<!doctype html>
 <html lang="en">
 <head>
@@ -635,7 +837,7 @@ export function compose(brief, plan, opts = {}) {
 <div id="root" data-composition-id="cue" data-start="0" data-duration="${r3(duration)}" data-width="${W}" data-height="${H}" data-fps="30">
 <div id="bgl" class="clip" data-start="0" data-duration="${r3(duration)}" data-track-index="0"></div>
 ${html}
-<div id="fx" class="clip" data-start="0" data-duration="${r3(duration)}" data-track-index="6"><div id="fx-blocks">${blocks}</div><div id="fx-glitch"></div><div id="fx-flash"></div><div id="fx-grain"></div><div id="fx-vig"></div></div>
+ <div id="fx" class="clip" data-start="0" data-duration="${r3(duration)}" data-track-index="6"><div id="fx-blocks">${blocks}</div><div id="fx-glitch"></div><div id="fx-flash"></div><div id="fx-grain"></div><div id="fx-vig"></div></div>
 ${hud}
 ${audioTag}
 </div>
@@ -659,12 +861,13 @@ function sceneLabel(sc) {
   return String(sc.word || (sc.words || []).join(" ") || sc.text || sc.title || sc.caption || sc.value || sc.type || "").slice(0, 40);
 }
 
-function buildCSS({ W, H, P, S, u, portrait, grain, motion = {} }) {
+function buildCSS({ W, H, P, S, u, portrait, grain, motion = {}, treatment = {} }) {
   const noise = "data:image/svg+xml;utf8," + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1.4 0'/></filter><rect width='100%' height='100%' filter='url(#n)'/></svg>`);
   const scan = "repeating-linear-gradient(0deg, rgba(255,0,90,.5) 0 3px, transparent 3px 11px, rgba(0,220,255,.45) 11px 13px, transparent 13px 29px)";
-  const effect = motion.effect || "clean";
+  const effect = treatment.effect || "clean";
   const stageFilter = effect === "soft" || effect === "paper" ? "saturate(.92) contrast(.98)" : effect === "chromatic" ? "saturate(1.12) contrast(1.04)" : "none";
-  const stageOverlay = effect === "scan" ? `background-image:${scan};opacity:.055;` : effect === "glow" ? `background:radial-gradient(circle at 65% 42%, ${P.field}22, transparent 48%);opacity:.65;` : effect === "glass" ? `background:linear-gradient(115deg, transparent 35%, rgba(255,255,255,.12) 50%, transparent 65%);opacity:.48;` : "opacity:0;";
+  const stageOverlay = treatment.scan ? `background-image:${scan};opacity:.035;` : effect === "glow" ? `background:radial-gradient(circle at 65% 42%, ${P.field}22, transparent 48%);opacity:.35;` : effect === "glass" ? `background:linear-gradient(115deg, transparent 35%, rgba(255,255,255,.12) 50%, transparent 65%);opacity:.28;` : "opacity:0;";
+  const chromeH = treatment.chrome ? Math.round(u * 4.4) : 0;
   return `
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
@@ -672,11 +875,12 @@ html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
   --accent:${P.accent};--field:${P.field};--onAccent:${P.onAccent};--fg:${P.fg};--bg:${P.bg};--surface:${P.surface};--muted:${P.muted};--second:${P.second}}
 #bgl{position:absolute;inset:0;background:radial-gradient(120% 90% at 20% 0%, ${S.dark ? mix(P.bg, P.field, 0.16) : mix(P.bg, P.field, 0.1)} 0%, ${P.bg} 60%)}
 .scene{position:absolute;inset:0;overflow:hidden}
-.sc{position:absolute;inset:0;will-change:transform,filter}
+ .sc{position:absolute;inset:0;will-change:transform,filter}
+ .motion-stage{position:absolute;inset:0;will-change:transform;transform-origin:50% 50%}
 .window-group{position:absolute;inset:0;overflow:hidden}
 .window-rig{position:absolute;inset:0;display:grid;place-items:center;perspective:${Math.round(W * 1.4)}px;transform-style:preserve-3d;will-change:transform}
 .window-rig .browser{transform-style:preserve-3d}
-.window-stage{position:absolute;left:0;right:0;top:${Math.round(u * 4.4)}px;bottom:0;overflow:hidden;background:var(--surface);transform-style:preserve-3d;filter:${stageFilter}}
+ .window-stage{position:absolute;left:0;right:0;top:${chromeH}px;bottom:0;overflow:hidden;background:var(--surface);transform-style:preserve-3d;filter:${stageFilter}}
 .window-stage:after{content:"";position:absolute;inset:0;pointer-events:none;${stageOverlay}}
 .window-camera,.window-world{position:absolute;inset:0;transform-style:preserve-3d;will-change:transform}
 .window-shot{position:absolute;inset:0;transform:translate3d(var(--wx),var(--wy),var(--wz)) scale(var(--ws));transform-origin:50% 50%;transform-style:preserve-3d;will-change:transform,opacity}
@@ -684,7 +888,7 @@ html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
 .window-page{position:absolute;inset:0;overflow:hidden;background:var(--surface);border-radius:${Math.round(u * 0.6)}px}
 .window-page .shot{top:0}
 .window-page .viewport{top:0}
-.window-count{margin-left:auto;font-size:${Math.round(u * 1.35)}px;color:var(--muted);opacity:.65}
+ .window-count{position:absolute;right:${Math.round(u * 1.8)}px;top:${Math.max(4, Math.round(u * .9))}px;font-size:${Math.round(u * 1.35)}px;color:var(--muted);opacity:${treatment.chrome ? .65 : .45};z-index:2}
 .ground{position:absolute;inset:0;background:radial-gradient(110% 80% at 70% 110%, ${mix(P.bg, P.field, S.dark ? 0.2 : 0.12)} 0%, ${P.bg} 58%)}
 .cam{position:absolute;inset:0;display:flex;flex-direction:column;padding:0 ${Math.round(W * (portrait ? 0.08 : 0.075))}px}
 .center{align-items:center;justify-content:center;text-align:center}
@@ -710,16 +914,15 @@ html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
 .chrome{height:${Math.round(u * 4.4)}px;display:flex;align-items:center;gap:${Math.round(u * 0.8)}px;padding:0 ${Math.round(u * 1.8)}px;background:${S.dark ? "#1b1b1d" : "#ecebe7"};border-bottom:1px solid rgba(${S.dark ? "255,255,255" : "0,0,0"},.07)}
 .chrome i{width:${Math.round(u * 1.2)}px;height:${Math.round(u * 1.2)}px;border-radius:50%;background:${S.dark ? "#3a3a3d" : "#c9c6bf"}}
 .chrome .url{margin-left:${Math.round(u * 2)}px;font-size:${Math.round(u * 1.6)}px;color:var(--muted);background:${S.dark ? "#262629" : "#fff"};padding:${Math.round(u * 0.5)}px ${Math.round(u * 2)}px;border-radius:99px;flex:0 1 auto}
-.shot{position:absolute;left:0;right:0;top:${Math.round(u * 4.4)}px;bottom:0;background-size:cover;background-position:top center}
+ .shot{position:absolute;left:0;right:0;top:${chromeH}px;bottom:0;background-size:cover;background-position:50% 50%;background-repeat:no-repeat}
 .ghost{background:linear-gradient(135deg,var(--surface),${mix(P.surface, P.field, 0.25)});padding:${Math.round(u * 5)}px;display:flex;flex-direction:column;gap:${Math.round(u * 2)}px}
 .ghost div{border-radius:${Math.round(u)}px;background:rgba(${S.dark ? "255,255,255" : "0,0,0"},.08)}
 .gh1{height:18%;width:60%;background:var(--accent)!important;opacity:.8}.gh2{height:10%;width:85%}.gh3{height:30%;width:100%}
 .glare{position:absolute;inset:0;background:linear-gradient(105deg,transparent 35%,rgba(255,255,255,.22) 50%,transparent 65%);pointer-events:none}
-.shared-anchor{position:absolute;right:${Math.round(u * 7)}px;bottom:${Math.round(u * 6)}px;width:${Math.round(u * 13)}px;height:${Math.round(u * 8)}px;border:2px solid var(--accent);border-radius:${Math.round(u * 1.2)}px;opacity:0;pointer-events:none;box-shadow:0 0 ${Math.round(u * 2.5)}px ${P.field}66;transform-origin:50% 50%}
-.shared-anchor:before{content:"";position:absolute;inset:-${Math.round(u * 0.7)}px;border:1px solid ${P.field}55;border-radius:inherit}
-.shared-anchor i{position:absolute;right:${Math.round(u * 1.2)}px;top:${Math.round(u * 1.2)}px;width:${Math.round(u * 1.1)}px;height:${Math.round(u * 1.1)}px;border-radius:50%;background:var(--accent);box-shadow:0 0 ${Math.round(u * 1.8)}px var(--accent)}
-.cap{margin-top:${Math.round(u * 3.5)}px}
-.viewport{position:absolute;left:0;right:0;top:${Math.round(u * 4.4)}px;bottom:0;overflow:hidden}
+ .target-mark{position:absolute;border:1px solid var(--accent);border-radius:${Math.round(u * .7)}px;box-shadow:0 0 ${Math.round(u * 1.4)}px ${P.field}55;opacity:0;pointer-events:none;transform-origin:50% 50%}
+ .target-mark:after{content:"";position:absolute;right:${Math.round(u * .8)}px;top:${Math.round(u * .8)}px;width:${Math.max(3, Math.round(u * .9))}px;height:${Math.max(3, Math.round(u * .9))}px;border-radius:50%;background:var(--accent)}
+ .cap{margin-top:${Math.round(u * 3.5)}px}
+ .viewport{position:absolute;left:0;right:0;top:${chromeH}px;bottom:0;overflow:hidden}
 .tall{display:block;width:100%;height:auto}
 .tallghost{position:relative!important;top:0!important;height:260%!important}
 .feat{flex-direction:${portrait ? "column" : "row"};align-items:${portrait ? "flex-start" : "center"};justify-content:${portrait ? "center" : "flex-start"};gap:${Math.round(u * 4)}px}
@@ -770,8 +973,8 @@ html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
 #fx-blocks i:nth-child(even){background:${mix(P.field, S.dark ? "#000000" : "#ffffff", 0.2)}}
 #fx-glitch{position:absolute;inset:0;background:${scan};mix-blend-mode:screen;opacity:0}
 #fx-flash{position:absolute;inset:0;background:#fff;opacity:0}
-#fx-grain{position:absolute;inset:-50px;background-image:url("${noise}");opacity:${Math.max(grain, motion.grain || 0)};mix-blend-mode:${S.dark ? "overlay" : "multiply"}}
-#fx-vig{position:absolute;inset:0;background:radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,${S.dark ? 0.45 : 0.14}) 100%)}
+ #fx-grain{position:absolute;inset:-50px;background-image:url("${noise}");opacity:${grain};mix-blend-mode:${S.dark ? "overlay" : "multiply"}}
+ #fx-vig{position:absolute;inset:0;background:radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,${treatment.vignette || 0}) 100%)}
 #hud{position:absolute;left:0;right:0;top:0;z-index:600;pointer-events:none}
 .hud-in{display:flex;align-items:center;gap:${Math.round(u * 1.2)}px;padding:${Math.round(u * 3)}px ${Math.round(W * 0.04)}px 0;font-size:${Math.round(u * 1.5)}px;letter-spacing:.2em;color:${P.fg};opacity:.55}
 .hud-in .sp{flex:1}

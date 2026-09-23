@@ -1,123 +1,846 @@
-// Direction layer: talks to the Snapmy.site backend (direction + motion panel),
-// falls back to Kimi straight from the browser, then to the built-in director.
-import { API, KIMI_KEY, KIMI_BASE, KIMI_MODEL } from "./config.js";
-import { SCENE_TYPES, STYLES, fallbackPlan, resolveMotionVariation } from "./composer.js";
+// Direction layer: read a site into evidence, then turn that evidence into a
+// grounded story plan. Provider keys remain optional browser configuration;
+// only an explicit, non-secret brief is sent to a direction provider.
+import { API } from "./config.js";
+import { SCENE_TYPES, STYLES, resolveMotionVariation } from "./composer.js";
 
 const TRANSITIONS = ["whip", "zoom", "flash", "wipe", "iris", "push", "glitch", "blocks", "cut"];
+const INTERACTIONS = ["hover", "click", "scroll", "tab", "toggle", "modal", "none"];
+const MEDIA_TYPES = new Set(["screen", "scroll", "split"]);
+const GENERIC_CTA = /^(get started|try it(?: free| today)?|learn more|sign up|join now|click here|submit|continue)$/i;
 
-export async function api(path, body, { timeout = 60000 } = {}) {
-  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), timeout);
+const ROLE_RULES = [
+  ["pricing", /\b(pricing|plans|packages|cost|buy|checkout)\b/i],
+  ["proof", /\b(customers?|case studies|testimonials?|trusted|reviews?|stories|results?)\b/i],
+  ["result", /\b(results?|report|output|insights?|analytics?|dashboard|summary)\b/i],
+  ["workflow", /\b(workflow|how it works|demo|editor|workspace|upload|builder|create|automate|integrat|platform|product|features?)\b/i],
+  ["docs", /\b(docs?|documentation|guides?|api|developers?|changelog|reference)\b/i],
+  ["about", /\b(about|company|team|mission|careers?|contact)\b/i],
+  ["editorial", /\b(journal|blog|news|stories|insights?|magazine)\b/i],
+];
+
+const ACTION_WORDS = /\b(start|try|book|request|join|sign|learn|explore|discover|watch|see|view|buy|shop|download|create|build|launch|find|meet|contact|talk|subscribe|listen|tune|make|open|use)\b/i;
+
+const text = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+const clean = (value, max = 240) => text(value).replace(/^[—–-]\s*/, "").slice(0, max).trim();
+const unique = (values) => [...new Set(values.filter(Boolean).map(text))];
+const arrayOf = (value) => Array.isArray(value) ? value : value == null ? [] : [value];
+const lower = (value) => text(value).toLowerCase();
+const slug = (value) => lower(value).replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "page";
+
+function publicUrl(value) {
   try {
-    const r = await fetch(API + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal } : { signal: ctrl.signal });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
-    return j;
-  } finally { clearTimeout(t); }
+    const u = new URL(String(value));
+    if (!/^https?:$/.test(u.protocol)) return "";
+    ["key", "token", "secret", "password", "signature", "auth", "api_key", "access_token"].forEach((key) => u.searchParams.delete(key));
+    return u.href;
+  } catch { return ""; }
 }
 
-export async function backendAlive() { try { const j = await api("/health", null, { timeout: 3500 }); return !!j.ok; } catch { return false; } }
+function pageRoleFor(value, hint = "") {
+  const raw = `${value || ""} ${hint || ""}`.toLowerCase();
+  try { if (new URL(String(value)).pathname === "/") return "home"; } catch {}
+  if (!raw || /\bhome(?:page)?\b/.test(String(hint).toLowerCase())) return "home";
+  for (const [role, rule] of ROLE_RULES) if (rule.test(raw)) return role;
+  return "page";
+}
 
-/* ---------- reading fallback (no backend) ---------- */
+function assetRoleFor(pageRole, state = "default") {
+  if (pageRole === "pricing") return "pricing";
+  if (pageRole === "proof") return "proof";
+  if (pageRole === "result") return "result";
+  if (["workflow", "docs"].includes(pageRole)) return "workflow";
+  if (["about", "editorial"].includes(pageRole)) return "brand";
+  return state === "fullpage" ? "overview" : "hero";
+}
+
+function screenshotUrl(pageUrl, width, height, fullPage = false) {
+  const q = new URLSearchParams({
+    url: pageUrl,
+    screenshot: "true",
+    meta: "false",
+    embed: "screenshot.url",
+    "viewport.width": String(width),
+    "viewport.height": String(height),
+  });
+  if (fullPage) q.set("screenshot.fullPage", "true");
+  return `https://api.microlink.io/?${q.toString()}`;
+}
+
+function stripMarkdown(value) {
+  return clean(String(value || "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/[`*_>#|]/g, "")
+    .replace(/\s+/g, " "));
+}
+
+function markdownLines(md) {
+  return String(md || "").split("\n").map(stripMarkdown).filter(Boolean);
+}
+
+function markdownHeadings(md) {
+  return String(md || "").split("\n").map((line) => {
+    const m = line.match(/^(#{1,6})\s+(.+)$/);
+    return m ? { level: m[1].length, text: stripMarkdown(m[2]) } : null;
+  }).filter((h) => h && h.text.length > 2 && h.text.length < 140);
+}
+
+function extractLinks(md, base) {
+  const found = [];
+  const add = (label, href) => {
+    try {
+      const u = new URL(href, base);
+      if (u.origin !== new URL(base).origin || !/^https?:$/.test(u.protocol)) return;
+      u.hash = "";
+      const path = u.pathname.toLowerCase();
+      if (/\.(?:png|jpe?g|gif|svg|webp|avif|mp4|webm|pdf|zip)$/i.test(path)) return;
+      found.push({ url: u.href, label: clean(label, 100) });
+    } catch {}
+  };
+  for (const m of String(md || "").matchAll(/\[([^\]]{1,100})\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) add(m[1], m[2]);
+  for (const m of String(md || "").matchAll(/https?:\/\/[^\s)>]+/g)) add("", m[0].replace(/[.,;]+$/, ""));
+  return [...new Map(found.map((x) => [x.url, x])).values()];
+}
+
+function selectRouteLinks(links, homeUrl) {
+  const home = new URL(homeUrl);
+  const scored = links.filter((x) => x.url !== home.href && x.url !== `${home.origin}/`).map((x) => {
+    const role = pageRoleFor(x.url, x.label);
+    const score = (role === "page" ? 1 : 5) + (x.label ? 1 : 0) + (["workflow", "result", "proof", "pricing"].includes(role) ? 3 : 0);
+    return { ...x, role, score };
+  }).sort((a, b) => b.score - a.score || a.url.localeCompare(b.url));
+  const selected = [];
+  const roles = new Set();
+  for (const link of scored) {
+    if (selected.length >= 5) break;
+    if (roles.has(link.role) && link.role !== "page") continue;
+    selected.push(link); roles.add(link.role);
+  }
+  return selected;
+}
+
+async function fetchMarkdown(url, timeout = 9000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const r = await fetch(`https://r.jina.ai/${url}`, { headers: { Accept: "text/plain" }, signal: ctrl.signal });
+    if (!r.ok) return "";
+    const body = await r.text();
+    return /AuthenticationRequired|error/i.test(body.slice(0, 220)) && body.length < 700 ? "" : body;
+  } catch { return ""; }
+  finally { clearTimeout(timer); }
+}
+
+function extractStats(md) {
+  const results = [];
+  for (const line of markdownLines(md)) {
+    if (!/(%|\b(?:x|k|m|b|ms|s|h|days?|weeks?|users?|teams?|customers?)\b|faster|saved|accuracy|rate|time)/i.test(line)) continue;
+    const m = line.match(/([$€£]?\d[\d,.]*(?:\.\d+)?\s*(?:%|x|k|m|b|ms|s|h)?)/i);
+    if (!m || !m[1]) continue;
+    const value = clean(m[1], 18);
+    const label = clean(line.replace(m[1], "").replace(/^[-:|]+|[-:|]+$/g, ""), 64);
+    if (label.length > 2) results.push({ value, label });
+  }
+  return [...new Map(results.map((x) => [x.value.toLowerCase(), x])).values()].slice(0, 6);
+}
+
+function extractQuotes(md) {
+  return [...new Set(String(md || "").split("\n").filter((line) => /^\s*>/.test(line)).map((line) => clean(line.replace(/^\s*>+\s*/, ""), 180)).filter((line) => line.length > 10))]
+    .slice(0, 4).map((quote) => ({ text: quote, author: "" }));
+}
+
+function extractImages(md, pageUrl, pageRole) {
+  const images = [];
+  const add = (alt, src) => {
+    const url = publicUrl(src);
+    if (!url || images.some((x) => x.url === url)) return;
+    images.push({ id: `${slug(pageRole)}-asset-${images.length + 1}`, url, alt: clean(alt, 120), page: pageUrl, role: assetRoleFor(pageRole, "image"), kind: "image", source: "markdown" });
+  };
+  for (const m of String(md || "").matchAll(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g)) add(m[1], m[2]);
+  for (const m of String(md || "").matchAll(/<img[^>]+src=["']([^"']+)["'][^>]*>/gi)) add("", m[1]);
+  return images.slice(0, 24);
+}
+
+function extractCtas(lines) {
+  return unique(lines.filter((line) => line.length >= 3 && line.length <= 90 && ACTION_WORDS.test(line) && !/^https?:/i.test(line)).map((line) => stripMarkdown(line))).slice(0, 8);
+}
+
+function extractLogos(lines) {
+  const line = lines.find((x) => /\b(trusted by|used by|customers? include|teams at|backed by)\b/i.test(x));
+  if (!line) return [];
+  const tail = line.split(/trusted by|used by|customers? include|teams at|backed by/i)[1] || "";
+  return unique(tail.split(/[,•·|]|\s{2,}/).map((x) => stripMarkdown(x)).filter((x) => x.length > 1 && x.length < 32)).slice(0, 8);
+}
+
+function detectInteractions(md) {
+  const source = lower(md);
+  const rules = [
+    ["upload", /\b(upload|drop files?|drag and drop|import)\b/],
+    ["search", /\b(search|find anything|query)\b/],
+    ["filter", /\b(filter|sort by|segment)\b/],
+    ["editor", /\b(editor|edit|compose|design|canvas|builder)\b/],
+    ["toggle", /\b(toggle|switch|enable|disable)\b/],
+    ["tab", /\b(tabs?|navigate between|compare views?)\b/],
+    ["modal", /\b(modal|dialog|drawer|panel opens?)\b/],
+    ["scroll", /\b(scroll|timeline|longform|explore below)\b/],
+    ["click", /\b(click|select|choose|start|create|launch)\b/],
+  ];
+  const hits = rules.filter(([, rule]) => rule.test(source)).map(([interaction]) => interaction);
+  return hits.slice(0, 4).map((interaction, i) => ({ interaction, target: "visible product control", order: i + 1, source: "text-inference", confidence: "inferred" }));
+}
+
+function parsePage(md, pageUrl, hint = "") {
+  const role = pageRoleFor(pageUrl, hint);
+  const lines = markdownLines(md);
+  const headings = markdownHeadings(md);
+  const title = clean((md.match(/^Title:\s*(.+)$/im) || [])[1] || headings[0]?.text || hint || new URL(pageUrl).hostname, 120);
+  const headline = clean(headings[0]?.text || title, 120);
+  const paragraphs = lines.filter((line) => line.length >= 45 && line.length < 320 && !/^https?:/i.test(line)).slice(0, 10);
+  const featureHeads = headings.slice(1, 10).filter((h) => !/^(menu|navigation|footer|contact|subscribe|faq)$/i.test(h.text));
+  const features = featureHeads.slice(0, 8).map((h, i) => ({ title: h.text, desc: paragraphs[i + 1] || "", evidence: { page: pageUrl, pageRole: role } }));
+  const colors = unique([...String(md || "").matchAll(/#[0-9a-f]{3,8}\b/gi)].map((m) => m[0])).slice(0, 8);
+  const images = extractImages(md, pageUrl, role);
+  const ctas = extractCtas(lines);
+  return {
+    url: pageUrl,
+    role,
+    title,
+    headline,
+    description: paragraphs[0] || "",
+    headings: headings.slice(0, 12).map((h) => h.text),
+    features,
+    stats: extractStats(md),
+    quotes: extractQuotes(md),
+    logos: extractLogos(lines),
+    colors,
+    ctaCandidates: ctas,
+    images,
+    interactions: detectInteractions(md),
+    links: extractLinks(md, pageUrl),
+  };
+}
+
+function pageAsset(page, kind, viewport, width, height, priority, state = "default") {
+  const fullPage = kind === "fullpage";
+  const role = assetRoleFor(page.role, state);
+  return {
+    id: `${slug(page.role)}-${slug(new URL(page.url).pathname)}-${viewport || "page"}-${kind}`,
+    url: screenshotUrl(page.url, width, height, fullPage),
+    page: page.url,
+    pageRole: page.role,
+    role,
+    kind,
+    fullPage,
+    viewport,
+    width,
+    height,
+    state,
+    priority,
+    crop: "full",
+    focalPoint: "center",
+    safeTextRegions: ["top", "bottom"],
+    source: "microlink",
+  };
+}
+
+function mergePageFacts(pages) {
+  const home = pages[0] || {};
+  const allFeatures = pages.flatMap((page) => page.features || []);
+  const allStats = pages.flatMap((page) => page.stats || []);
+  const allQuotes = pages.flatMap((page) => page.quotes || []);
+  const allLogos = pages.flatMap((page) => page.logos || []);
+  const allCtas = pages.flatMap((page) => page.ctaCandidates || []);
+  const allInteractions = pages.flatMap((page) => page.interactions || []);
+  const images = pages.flatMap((page) => page.images || []);
+  return {
+    name: clean((home.title || home.headline || "").split(/[|–—:·]/)[0], 48),
+    headline: home.headline || home.title || "",
+    description: home.description || "",
+    features: [...new Map(allFeatures.filter((x) => x.title).map((x) => [lower(x.title), x])).values()].slice(0, 10),
+    stats: [...new Map(allStats.map((x) => [lower(`${x.value}:${x.label}`), x])).values()].slice(0, 8),
+    quotes: [...new Map(allQuotes.map((x) => [lower(x.text), x])).values()].slice(0, 4),
+    logos: unique(allLogos).slice(0, 8),
+    colors: unique(pages.flatMap((page) => page.colors || [])).slice(0, 8),
+    ctaCandidates: unique(allCtas).slice(0, 8),
+    interactionTrace: allInteractions.slice(0, 4),
+    sourceAssets: images.slice(0, 24),
+  };
+}
+
+function evidenceAssetsFor(pages) {
+  const assets = [];
+  pages.forEach((page, index) => {
+    assets.push(pageAsset(page, "screenshot", "desktop", 1440, 900, index === 0 ? 1 : 0.78));
+    if (index === 0) {
+      assets.push(pageAsset(page, "screenshot", "mobile", 720, 1280, 0.74, "responsive"));
+      assets.push(pageAsset(page, "fullpage", "desktop", 1440, 900, 0.92, "fullpage"));
+    } else if (["workflow", "result", "proof", "pricing"].includes(page.role)) {
+      assets.push(pageAsset(page, "fullpage", "desktop", 1440, 900, 0.7, "fullpage"));
+    }
+  });
+  return assets;
+}
+
+/* ---------- backend transport ---------- */
+function evidenceFromBrief(brief = {}) {
+  const raw = [...arrayOf(brief.evidenceAssets), ...arrayOf(brief.evidence), ...arrayOf(brief.assets)]
+    .filter((asset) => asset && typeof asset === "object");
+  const fromScreenshots = arrayOf(brief.screenshots).map((url, i) => ({ id: `screenshot-${i + 1}`, url, kind: "screenshot", role: "hero", pageRole: "home", priority: 0.5 }));
+  const all = [...raw, ...fromScreenshots].map((asset, i) => {
+    const url = publicUrl(asset.url || asset.src);
+    if (!url) return null;
+    return {
+      id: clean(asset.id || `evidence-${i + 1}`, 80),
+      url,
+      page: publicUrl(asset.page) || clean(asset.page, 300),
+      pageRole: clean(asset.pageRole || asset.page_role || "page", 32),
+      role: clean(asset.role || asset.assetRole || "overview", 32),
+      kind: clean(asset.kind || "screenshot", 24),
+      fullPage: Boolean(asset.fullPage || asset.fullpage || asset.isFullPage || asset.kind === "fullpage"),
+      viewport: clean(asset.viewport || "desktop", 20),
+      width: Number(asset.width) || 0,
+      height: Number(asset.height) || 0,
+      state: clean(asset.state || "default", 32),
+      crop: clean(asset.crop || "full", 32),
+      focalPoint: clean(asset.focalPoint || asset.focal_point || "center", 40),
+      safeTextRegions: arrayOf(asset.safeTextRegions || asset.safe_text_regions).map((x) => clean(x, 24)).filter(Boolean).slice(0, 4),
+      priority: Number(asset.priority) || 0,
+      source: clean(asset.source || "reader", 24),
+      alt: clean(asset.alt, 120),
+    };
+  }).filter(Boolean);
+  return [...new Map(all.map((asset) => [asset.url, asset])).values()];
+}
+
+function publicBrief(brief = {}) {
+  const evidenceAssets = evidenceFromBrief(brief);
+  const screenshots = unique([...arrayOf(brief.screenshots).map(publicUrl), ...evidenceAssets.map((asset) => asset.url)]);
+  const fullpages = unique([...arrayOf(brief.fullpages).map(publicUrl), ...evidenceAssets.filter((asset) => asset.kind === "fullpage").map((asset) => asset.url)]);
+  const pages = arrayOf(brief.pages).filter((page) => page && typeof page === "object").slice(0, 8).map((page) => ({
+    url: publicUrl(page.url), role: clean(page.role, 32), title: clean(page.title, 120), headline: clean(page.headline, 120),
+    description: clean(page.description, 300), headings: arrayOf(page.headings).map((x) => clean(x, 120)).slice(0, 12),
+  })).filter((page) => page.url || page.title);
+  return {
+    name: clean(brief.name, 80),
+    domain: clean(brief.domain, 120),
+    url: publicUrl(brief.url) || clean(brief.url, 300),
+    headline: clean(brief.headline, 160),
+    tagline: clean(brief.tagline, 160),
+    description: clean(brief.description, 360),
+    category: clean(brief.category, 60),
+    cta: clean(typeof brief.cta === "string" ? brief.cta : brief.cta?.text, 90),
+    ctaCandidates: arrayOf(brief.ctaCandidates).map((x) => clean(x, 90)).filter(Boolean).slice(0, 8),
+    hookCandidates: arrayOf(brief.hookCandidates || brief.hook).map((x) => clean(x, 100)).filter(Boolean).slice(0, 8),
+    features: arrayOf(brief.features).map((feature) => typeof feature === "string" ? { title: clean(feature, 80), desc: "" } : { title: clean(feature?.title, 80), desc: clean(feature?.desc || feature?.description, 220), evidence: feature?.evidence || undefined }).filter((feature) => feature.title).slice(0, 12),
+    stats: arrayOf(brief.stats).map((stat) => ({ value: clean(stat?.value, 24), label: clean(stat?.label, 80) })).filter((stat) => stat.value).slice(0, 8),
+    quotes: arrayOf(brief.quotes).map((quote) => ({ text: clean(quote?.text, 180), author: clean(quote?.author, 80) })).filter((quote) => quote.text).slice(0, 4),
+    logos: arrayOf(brief.logos).map((x) => clean(x, 40)).filter(Boolean).slice(0, 10),
+    colors: arrayOf(brief.colors).map((x) => clean(x, 16)).filter((x) => /^#[0-9a-f]{3,8}$/i.test(x)).slice(0, 10),
+    screenshots,
+    fullpage: publicUrl(brief.fullpage) || fullpages[0] || "",
+    fullpages,
+    pages,
+    pageRoles: arrayOf(brief.pageRoles).map((x) => typeof x === "string" ? clean(x, 32) : { url: publicUrl(x?.url), role: clean(x?.role, 32) }).slice(0, 8),
+    evidenceAssets: evidenceAssets.slice(0, 32),
+    sourceAssets: arrayOf(brief.sourceAssets).map((asset) => ({ id: clean(asset?.id, 80), url: publicUrl(asset?.url), page: publicUrl(asset?.page), role: clean(asset?.role, 32), kind: clean(asset?.kind || "image", 24), alt: clean(asset?.alt, 120) })).filter((asset) => asset.url).slice(0, 24),
+    interactionTrace: arrayOf(brief.interactionTrace).map((event) => ({ interaction: clean(event?.interaction, 24), target: clean(event?.target, 100), source: clean(event?.source, 32), confidence: clean(event?.confidence, 24) })).filter((event) => INTERACTIONS.includes(event.interaction)).slice(0, 6),
+    visualTokens: brief.visualTokens && typeof brief.visualTokens === "object" ? { mode: clean(brief.visualTokens.mode, 24), density: clean(brief.visualTokens.density, 24), radius: clean(brief.visualTokens.radius, 24), typography: clean(brief.visualTokens.typography, 80) } : {},
+  };
+}
+
+function requestBody(path, body) {
+  if (path !== "/direct" || !body || typeof body !== "object") return body;
+  return { ...body, brief: publicBrief(body.brief || {}) };
+}
+
+export async function api(path, body, { timeout = 60000 } = {}) {
+  const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const payload = requestBody(path, body);
+    const r = await fetch(API + path, payload ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: ctrl.signal } : { signal: ctrl.signal });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  } finally { clearTimeout(timer); }
+}
+
+export async function backendAlive() {
+  return (await backendStatus()).ok;
+}
+
+export async function backendStatus() {
+  try {
+    const result = await api("/health", null, { timeout: 3500 });
+    return { ok: !!result.ok, render: result.render || { available: false }, providers: result.providers || {} };
+  } catch {
+    return { ok: false, render: { available: false }, providers: {} };
+  }
+}
+
+/* ---------- evidence-aware browser reader ---------- */
 export async function readInBrowser(url) {
-  const u = new URL(/^https?:/i.test(url) ? url : "https://" + url);
-  const domain = u.host.replace(/^www\./, "");
-  let md = "";
-  try { const r = await fetch("https://r.jina.ai/" + u.href, { headers: { Accept: "text/plain" } }); if (r.ok) md = await r.text(); } catch {}
-  if (/AuthenticationRequired|error/i.test(md.slice(0, 200)) && md.length < 600) md = "";
-  const lines = md.split("\n").map((l) => l.trim()).filter(Boolean);
-  const title = (md.match(/^Title:\s*(.+)$/m) || [])[1] || domain;
-  const heads = lines.filter((l) => /^#{1,3}\s/.test(l)).map((l) => l.replace(/^#+\s*/, "").replace(/[*_`\[\]]/g, "")).filter((l) => l.length > 3 && l.length < 90);
-  const paras = lines.filter((l) => !/^[#!\[*|>-]/.test(l) && l.length > 50 && l.length < 260).slice(0, 8);
-  const shot = `https://api.microlink.io/?url=${encodeURIComponent(u.href)}&screenshot=true&meta=false&embed=screenshot.url&viewport.width=1440&viewport.height=900`;
-  const name = title.split(/[|\-–—:·]/)[0].trim().slice(0, 28) || domain;
-  return { name, domain, url: u.href, headline: heads[0] || title, description: paras[0] || "", features: heads.slice(1, 9).map((t) => ({ title: t, desc: "" })), stats: [], quotes: [], logos: [], colors: [], logo: "", screenshots: [shot], fullpage: "", hookCandidates: heads.slice(0, 5), paras };
+  const target = new URL(/^https?:/i.test(url) ? url : `https://${url}`);
+  ["key", "token", "secret", "password", "signature", "auth", "api_key", "access_token"].forEach((key) => target.searchParams.delete(key));
+  target.hash = "";
+  const homeUrl = target.href;
+  const markdown = await fetchMarkdown(homeUrl);
+  const home = parsePage(markdown, homeUrl, "home");
+  const routeLinks = selectRouteLinks(extractLinks(markdown, homeUrl), homeUrl);
+  const routePages = await Promise.all(routeLinks.map(async (link) => parsePage(await fetchMarkdown(link.url, 7000), link.url, link.label)));
+  const pages = [home, ...routePages];
+  const assets = evidenceAssetsFor(pages);
+  const facts = mergePageFacts(pages);
+  const domain = target.host.replace(/^www\./, "");
+  const name = facts.name || domain.split(".")[0] || domain;
+  const evidence = assets.map((asset) => ({ ...asset, page: asset.page || homeUrl }));
+  const visualTokens = {
+    mode: facts.colors.some((color) => parseInt(color.slice(1, 3), 16) < 60) ? "dark-signal" : "light-signal",
+    density: pages.some((page) => (page.features || []).length > 5) ? "dense" : "open",
+    radius: "unknown",
+    typography: "reader-inferred",
+  };
+  return {
+    name,
+    domain,
+    url: homeUrl,
+    headline: facts.headline || name,
+    tagline: facts.headline || "",
+    description: facts.description,
+    features: facts.features,
+    stats: facts.stats,
+    quotes: facts.quotes,
+    logos: facts.logos,
+    colors: facts.colors,
+    category: pages.find((page) => page.role !== "home")?.role || "product",
+    cta: facts.ctaCandidates[0] || "",
+    ctaCandidates: facts.ctaCandidates,
+    hookCandidates: unique([facts.headline, ...pages.flatMap((page) => page.headings || []).slice(0, 7)]).slice(0, 8),
+    pages: pages.map((page) => ({ url: page.url, role: page.role, title: page.title, headline: page.headline, description: page.description, headings: page.headings })),
+    pageRoles: pages.map((page) => ({ url: page.url, role: page.role })),
+    evidenceAssets: evidence,
+    assets: evidence,
+    screenshots: evidence.map((asset) => asset.url),
+    fullpages: evidence.filter((asset) => asset.kind === "fullpage").map((asset) => asset.url),
+    fullpage: evidence.find((asset) => asset.kind === "fullpage")?.url || "",
+    sourceAssets: facts.sourceAssets,
+    interactionTrace: facts.interactionTrace,
+    visualTokens,
+    logo: facts.sourceAssets.find((asset) => /logo|brand|wordmark/i.test(asset.alt || ""))?.url || "",
+    paras: [facts.description, ...pages.flatMap((page) => page.description ? [page.description] : [])].filter(Boolean).slice(0, 8),
+  };
 }
 
 /* ---------- Kimi from the browser (CORS-enabled) ---------- */
-const PANEL_SYSTEM = `You are the directing room of Snapmy.site, a studio that turns a website into a 30-second beat-synced launch film: a creative director plus three senior motion designers ("Kinetic typographer", "Music editor", "Brand designer").
-EVERY shot lasts exactly 1.5 seconds (one bar at 160 BPM). 18-22 shots. Shot 1 "coldopen", last "endcard", the one before "cta".
-Tiny text: hook words 1-2 words each (max 4 words), statement max 9 words, feature title max 5 words, sub max 9, flashword ONE word, caption max 5, stat label max 6, quote max 18.
-Use ONLY facts in the brief; "stat" only with brief.stats values, "quote" only with brief.quotes, "logos" only with brief.logos (min 3 names).
-Arc: hook → tension → DROP on the first product "screen" around shot 5 → features with rhythm → proof → payoff → cta → endcard. Never three text-only shots of the same type in a row.
-Shot types: coldopen{word} | hook{words[]} | statement{text,accent,kicker?} | flashword{word} | screen{shot,caption,interaction?} | scroll{shot,interaction?} | feature{title,sub?,kicker?} | featureStack{items[3]} | stat{value,label} | quote{text,author} | logos{names[]} | marquee{text} | split{shot,text,interaction?} | cta{text,button} | endcard{text}
-Use the supplied hidden motion direction to choose pacing, continuous camera behavior, product interactions, and sound emphasis. Return one hidden "motion_variation" id from mv001 through mv100. Use interaction values only when they fit the visible product moment: hover|click|scroll|tab|toggle|modal|none. Do not reveal implementation transition names in the title, tagline, or panel notes; the engine maps the motion direction internally.
-Optional internal "transition" per shot may still be used when a hard boundary is clearly appropriate: whip|zoom|flash|wipe|iris|push|glitch|blocks|cut.
-Draft, let each panelist give ONE concrete note (max 22 words, name shot numbers), apply the notes, output ONLY JSON: {"title":string,"tagline":string,"motion_variation":"mv001","panel":[{"role":string,"note":string}],"scenes":[...]}`;
+const PANEL_SYSTEM = `You are the directing room of Snapmy.site. Build a grounded launch film from the supplied evidence package, not from a universal template.
+Use only facts and visible evidence in the brief. The evidence assets have ids, page roles, asset roles, viewport states, and real URLs. Choose them deliberately; never invent a screenshot URL or claim an interaction that is not in interactionTrace.
+Select one story grammar from: demo, conversion, signal, brand, consumer, developer, product. Vary the number and order of shots according to the evidence. Use 10-22 shots, with coldopen first, cta immediately before endcard, and endcard last. A fullpage asset is required for scroll. Never use the same asset in adjacent visual shots unless visual_reason says hold, match-cut, or transformation.
+The composer currently supports these shot types: coldopen{word} | hook{words[]} | statement{text,accent,kicker?} | flashword{word} | screen{asset_id,caption,interaction?} | scroll{asset_id,interaction?} | feature{title,sub?,kicker?} | featureStack{items[3]} | stat{value,label} | quote{text,author} | logos{names[]} | marquee{text} | split{asset_id,text,interaction?} | cta{text,button} | endcard{text}.
+Keep text short: hook words 1-2 words each (max 4), statement max 9 words where possible, feature title max 5 words, sub max 12, quote max 18, CTA max 30. Use only brief.stats values, brief.quotes, and brief.logos for proof.
+Every visual shot should include asset_id and visual_reason. Optional motion is per shot: {entrance,exit,velocity,anticipation,overshoot,settle,hold,sound}. beats may be 0.5, 1, 2, or 4 and express editorial intent even though the current preview is beat-quantized. Return only JSON: {title,tagline,story_grammar,motion_variation,panel:[{role,note}],scenes:[...]}.
+Each panelist gives one concrete note with shot numbers, max 22 words. Do not use generic CTA copy when the brief has a product CTA.`;
+
+function directionPayload(brief, decisions = {}) {
+  const b = publicBrief(brief);
+  const motion = resolveMotionVariation(decisions.motionVariation || decisions.motion_variation || decisions.motion?.variation, b, decisions.style).id;
+  return {
+    name: b.name,
+    domain: b.domain,
+    url: b.url,
+    headline: b.headline,
+    tagline: b.tagline,
+    description: b.description,
+    category: b.category,
+    cta: b.cta,
+    cta_candidates: b.ctaCandidates,
+    hook_candidates: b.hookCandidates,
+    features: b.features,
+    stats: b.stats,
+    quotes: b.quotes,
+    logos: b.logos,
+    colors: b.colors,
+    pages: b.pages,
+    page_roles: b.pageRoles,
+    screenshots: b.screenshots,
+    fullpages: b.fullpages,
+    evidence_assets: b.evidenceAssets,
+    source_assets: b.sourceAssets,
+    interaction_trace: b.interactionTrace,
+    visual_tokens: b.visualTokens,
+    direction: {
+      style: decisions.style,
+      energy: decisions.energy,
+      hook_pick: decisions.hook,
+      story_grammar: decisions.grammar || chooseGrammar(b, decisions),
+      motion_variation: motion,
+      motion_direction: decisions.motionDirective || decisions.motion || null,
+    },
+  };
+}
 
 export async function kimiInBrowser(brief, decisions = {}) {
-  if (!KIMI_KEY) throw new Error("no browser key");
-  const payload = { name: brief.name, domain: brief.domain, headline: brief.headline, description: brief.description, hook_pick: decisions.hook, features: (brief.features || []).slice(0, 8), stats: (brief.stats || []).slice(0, 4), quotes: (brief.quotes || []).slice(0, 2), logos: (brief.logos || []).slice(0, 8), screenshots_available: (brief.screenshots || []).length, style: decisions.style, motion_variation: resolveMotionVariation(decisions.motionVariation || decisions.motion_variation || decisions.motion?.variation, brief, decisions.style).id, motion_direction: decisions.motionDirective || decisions.motion || null };
-  const r = await fetch(KIMI_BASE + "/chat/completions", { method: "POST", headers: { Authorization: "Bearer " + KIMI_KEY, "Content-Type": "application/json" }, body: JSON.stringify({ model: KIMI_MODEL, thinking: { type: "disabled" }, response_format: { type: "json_object" }, temperature: 0.6, messages: [{ role: "system", content: PANEL_SYSTEM }, { role: "user", content: "Brief:\n" + JSON.stringify(payload) }] }) });
-  if (!r.ok) throw new Error("kimi " + r.status);
-  const j = await r.json();
-  return JSON.parse((j.choices?.[0]?.message?.content || "{}").replace(/^```json|```$/g, ""));
+  // Provider credentials are server-only. This remains the offline creative pass.
+  return localPlan(brief, decisions);
 }
 
-/* ---------- heuristics when JEV is unreachable ---------- */
+/* ---------- evidence-led decisions and local story grammars ---------- */
+function briefText(brief) {
+  return [brief.name, brief.domain, brief.headline, brief.description, brief.category, ...arrayOf(brief.features).flatMap((x) => [x?.title, x?.desc]), ...arrayOf(brief.pages).flatMap((x) => [x?.role, x?.title, x?.description])].filter(Boolean).join(" ");
+}
+
+function chooseGrammar(brief, decisions = {}) {
+  const roles = new Set(arrayOf(brief.pages).map((page) => typeof page === "string" ? page : page?.role).filter(Boolean));
+  const assets = new Set(evidenceFromBrief(brief).map((asset) => asset.role));
+  const interaction = arrayOf(brief.interactionTrace).length > 0;
+  if ((roles.has("workflow") || assets.has("workflow")) && (roles.has("result") || assets.has("result"))) return "demo";
+  if (roles.has("pricing") || assets.has("pricing")) return "conversion";
+  if ((roles.has("result") || assets.has("result")) && (brief.stats || []).length) return "signal";
+  if (roles.has("workflow") || roles.has("result") || assets.has("workflow") || assets.has("result")) return "product";
+  if (decisions.style === "editorial" && !interaction) return "brand";
+  if (decisions.style === "pop" && interaction) return "consumer";
+  if (/(developer|api|docs|cli|sdk|terminal|code)/i.test(briefText(brief)) && interaction) return "developer";
+  return interaction ? "product" : "brand";
+}
+
+function inferStyle(brief) {
+  const scores = Object.fromEntries(Object.keys(STYLES).map((key) => [key, 0]));
+  const b = publicBrief(brief);
+  const roles = new Set(b.pages.map((page) => page.role));
+  const assets = new Set(b.evidenceAssets.map((asset) => asset.role));
+  const source = lower(briefText(b));
+  if (roles.has("docs") || source.includes("developer") || source.includes("api")) { scores.mono += 3; scores.neon += 2; }
+  if (roles.has("workflow") || assets.has("workflow")) { scores.kinetic += 2; scores.mono += 1; }
+  if (roles.has("pricing") || roles.has("proof")) { scores.editorial += 2; scores.mono += 1; }
+  if (roles.has("editorial") || roles.has("about")) scores.editorial += 3;
+  if (b.interactionTrace.some((x) => ["toggle", "modal", "filter"].includes(x.interaction))) scores.neon += 2;
+  if (b.colors.some((color) => { const r = parseInt(color.slice(1, 3), 16), g = parseInt(color.slice(3, 5), 16), bl = parseInt(color.slice(5, 7), 16); return Math.max(r, g, bl) - Math.min(r, g, bl) > 130; })) { scores.pop += 2; scores.neon += 1; }
+  if (/(finance|legal|health|wellness|journal|luxury|research)/i.test(source)) scores.editorial += 2;
+  if (/(gaming|social|creator|fashion|food|kids|shop)/i.test(source)) scores.pop += 2;
+  if (/(security|analytics|signal|data|infrastructure)/i.test(source)) scores.neon += 2;
+  const [style] = Object.entries(scores).sort((a, b2) => b2[1] - a[1])[0];
+  return style || "kinetic";
+}
+
 export function guessDecisions(brief) {
-  const t = [brief.name, brief.headline, brief.description, ...(brief.features || []).map((f) => f.title)].join(" ").toLowerCase();
-  let style = "kinetic";
-  if (/(finance|bank|wealth|legal|insur|luxury|wellness|health|journal|media|magazine)/.test(t)) style = "editorial";
-  else if (/(crypto|web3|security|gaming|api|developer|terminal|cli)/.test(t)) style = "neon";
-  else if (/(food|kids|social|creator|shop|store|fun|play|fashion)/.test(t)) style = "pop";
-  else if (/(design|enterprise|hardware|minimal|studio)/.test(t)) style = "mono";
-  return { style, energy: 1.8, hook: (brief.hookCandidates || [])[0] || brief.headline, motionVariation: resolveMotionVariation(null, brief, style).id, source: "heuristic" };
+  const publicData = publicBrief(brief);
+  const style = inferStyle(publicData);
+  const grammar = chooseGrammar(publicData, { style });
+  const hook = publicData.hookCandidates?.[0] || publicData.headline || publicData.name;
+  const evidenceCount = publicData.evidenceAssets.length;
+  const energy = Math.min(2.8, Math.max(0.9, 1.15 + (publicData.interactionTrace.length * 0.24) + (publicData.stats.length * 0.12) + (evidenceCount > 3 ? 0.25 : 0)));
+  return {
+    style,
+    energy,
+    hook,
+    grammar,
+    motionVariation: resolveMotionVariation(null, publicData, style).id,
+    source: "heuristic",
+    evidence: { assets: evidenceCount, pages: publicData.pages.length, interactions: publicData.interactionTrace.length },
+  };
 }
 
-/* ---------- sanitize whatever the LLM returns ---------- */
-export function normalizePlan(raw, brief, decisions) {
-  const shotsN = Math.max(1, (brief.screenshots || []).length);
-  const logos = brief.logos || [];
-  const statVals = new Set((brief.stats || []).map((s) => String(s.value)));
-  const clean = (s, n) => String(s ?? "").replace(/^[—–-]\s*/, "").replace(/\s+/g, " ").trim().slice(0, n);
-  let scenes = (raw?.scenes || []).filter((s) => s && SCENE_TYPES.includes(s.type)).map((s) => {
-    const o = { type: s.type };
-    if (TRANSITIONS.includes(s.transition)) o.transition = s.transition;
-    if (s.interaction && ["hover", "click", "scroll", "tab", "toggle", "modal", "none"].includes(s.interaction)) o.interaction = s.interaction;
-    switch (s.type) {
-      case "coldopen": o.word = clean(s.word || brief.name, 24); break;
-      case "hook": o.words = (Array.isArray(s.words) ? s.words : String(s.words || s.text || "").split(/\s+/)).map((w) => clean(w, 22)).filter(Boolean).slice(0, 4); break;
-      case "statement": o.text = clean(s.text, 70); o.accent = clean(s.accent, 20); if (s.kicker) o.kicker = clean(s.kicker, 24); break;
-      case "flashword": o.word = clean(String(s.word || s.text || "").split(/\s+/)[0], 16); break;
-      case "screen": case "scroll": o.shot = Math.abs(parseInt(s.shot) || 0) % shotsN; if (s.caption) o.caption = clean(s.caption, 34); break;
-      case "split": o.shot = Math.abs(parseInt(s.shot) || 0) % shotsN; o.text = clean(s.text, 48); break;
-      case "feature": o.title = clean(s.title || s.text, 40); if (s.sub) o.sub = clean(s.sub, 70); if (s.kicker) o.kicker = clean(s.kicker, 24); break;
-      case "featureStack": o.items = (s.items || []).map((x) => clean(typeof x === "string" ? x : x?.title, 26)).filter(Boolean).slice(0, 3); break;
-      case "stat": o.value = clean(s.value, 10); o.label = clean(s.label, 48); break;
-      case "quote": o.text = clean(s.text, 120); o.author = clean(s.author, 40); break;
-      case "logos": o.names = (s.names || []).map((x) => clean(x, 18)).filter(Boolean).slice(0, 6); break;
-      case "marquee": o.text = clean(s.text || brief.name, 26); break;
-      case "cta": o.text = clean(s.text || "Try it free", 30); o.button = clean(s.button || "Get started", 22); break;
-      case "endcard": o.text = clean(s.text || raw?.tagline || brief.headline, 60); break;
-    }
-    return o;
-  }).filter((s) => {
-    if (s.type === "hook") return s.words.length > 0;
-    if (s.type === "logos") return s.names.length >= 3 && s.names.every((n) => logos.length === 0 || logos.some((l) => l.toLowerCase() === n.toLowerCase()));
-    if (s.type === "stat") return !!s.value && (statVals.size === 0 ? false : statVals.has(s.value));
-    if (s.type === "featureStack") return s.items.length === 3;
-    if (s.type === "quote") return s.text.length > 10;
-    return true;
-  });
-  // keep at most 4 numbered features; fold the rest into a three-item stack
-  const feats = scenes.filter((s) => s.type === "feature");
-  if (feats.length > 4) {
-    const extra = feats.slice(4); const items = extra.map((f) => f.title).slice(0, 3);
-    const firstExtra = scenes.indexOf(extra[0]);
-    scenes = scenes.filter((s) => !extra.includes(s));
-    if (items.length === 3 && !scenes.some((s) => s.type === "featureStack")) scenes.splice(firstExtra, 0, { type: "featureStack", items });
+function ctaFor(brief) {
+  const b = publicBrief(brief);
+  const candidates = unique([b.cta, ...b.ctaCandidates]).filter((candidate) => candidate && candidate.length < 90);
+  const actual = candidates.find((candidate) => !GENERIC_CTA.test(candidate));
+  const name = b.name || b.domain || "this product";
+  return {
+    text: b.headline || b.description || `See ${name} in action`,
+    button: actual || candidates[0] || `See ${name} in action`,
+  };
+}
+
+function evidencePool(brief) {
+  const b = publicBrief(brief);
+  const screenshots = b.screenshots;
+  return evidenceFromBrief(b).map((asset) => ({ ...asset, index: Math.max(0, screenshots.indexOf(asset.url)) })).filter((asset) => asset.url);
+}
+
+function pickEvidence(brief, desiredRole, kind, state) {
+  const pool = evidencePool(brief).filter((asset) => kind === "fullpage" ? asset.kind === "fullpage" : asset.kind !== "fullpage");
+  if (!pool.length) return null;
+  const used = state.used || new Set();
+  const roleMatches = pool.filter((asset) => asset.role === desiredRole || asset.pageRole === desiredRole);
+  const candidates = [...roleMatches, ...pool.filter((asset) => !roleMatches.includes(asset))].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  const next = candidates.find((asset) => !used.has(asset.id) && asset.id !== state.last) || candidates.find((asset) => asset.id !== state.last) || candidates[0];
+  if (next) { used.add(next.id); state.last = next.id; }
+  return next || null;
+}
+
+function mediaScene(brief, desiredRole, type, state, caption = "") {
+  const wantedKind = type === "scroll" ? "fullpage" : "screenshot";
+  let asset = pickEvidence(brief, desiredRole, wantedKind, state);
+  let actualType = type;
+  if (!asset && type === "scroll") { actualType = "screen"; asset = pickEvidence(brief, desiredRole, "screenshot", state); }
+  if (!asset) return null;
+  const interaction = arrayOf(brief.interactionTrace).find((event) => INTERACTIONS.includes(event?.interaction))?.interaction || "none";
+  return {
+    type: actualType,
+    shot: asset.index,
+    src: asset.url,
+    asset,
+    asset_id: asset.id,
+    assetRole: asset.role,
+    visualReason: `${asset.role} evidence from the ${asset.pageRole} page`,
+    caption: caption || undefined,
+    interaction: actualType === "scroll" ? "scroll" : interaction,
+    beats: actualType === "scroll" ? 2 : 1,
+  };
+}
+
+function featureScene(feature, index) {
+  return feature ? { type: "feature", title: feature.title, sub: feature.desc, index, beats: 1 } : null;
+}
+
+function proofScene(brief, index = 0) {
+  const stats = arrayOf(brief.stats).filter((stat) => stat?.value);
+  const quotes = arrayOf(brief.quotes).filter((quote) => quote?.text);
+  const logos = arrayOf(brief.logos).filter(Boolean);
+  if (stats[index]) return { type: "stat", value: stats[index].value, label: stats[index].label, beats: 1 };
+  if (quotes[0]) return { type: "quote", text: quotes[0].text, author: quotes[0].author, beats: 2 };
+  if (logos.length >= 3) return { type: "logos", names: logos.slice(0, 6), beats: 2 };
+  return null;
+}
+
+function localPlan(brief, decisions = {}) {
+  const b = publicBrief(brief);
+  const style = STYLES[decisions.style] ? decisions.style : inferStyle(b);
+  const grammar = decisions.grammar || chooseGrammar(b, { ...decisions, style });
+  const features = b.features.filter((feature) => feature.title);
+  const state = { used: new Set(), last: "" };
+  const hook = String(decisions.hook || b.hookCandidates?.[0] || b.headline || b.name).split(/\s+/).filter(Boolean).slice(0, 4);
+  const cta = ctaFor(b);
+  const scenes = [
+    { type: "coldopen", word: b.name, beats: 1 },
+    { type: "hook", words: hook, beats: 1 },
+  ];
+  const add = (scene) => { if (scene) scenes.push(scene); };
+  const statement = (value, kicker) => value ? { type: "statement", text: value, kicker: kicker || b.category || "", beats: 2 } : null;
+  const addFeature = (index) => add(featureScene(features[index], index));
+  const addMedia = (role, type, caption) => add(mediaScene(b, role, type, state, caption));
+
+  if (grammar === "demo") {
+    add(statement(b.description || b.headline, b.category));
+    addMedia("workflow", "screen", features[0]?.title || b.headline);
+    addFeature(0);
+    addMedia("result", "screen", features[1]?.title || b.headline);
+    addFeature(1);
+    add(proofScene(b));
+    addMedia("proof", "split", b.headline);
+  } else if (grammar === "conversion") {
+    addMedia("hero", "screen", b.headline);
+    add(statement(b.headline || b.description, b.category));
+    addMedia("pricing", "screen", "");
+    addFeature(0);
+    add(proofScene(b));
+    if (features.length >= 3) add({ type: "featureStack", items: features.slice(0, 3).map((feature) => feature.title), beats: 2 });
+  } else if (grammar === "signal") {
+    add(statement(b.headline || b.description, ""));
+    addMedia("workflow", "screen", features[0]?.title || b.headline);
+    add(proofScene(b));
+    addMedia("result", "split", features[1]?.title || b.headline);
+    addFeature(0);
+    if (b.quotes.length) add(proofScene(b, 1));
+  } else if (grammar === "brand") {
+    add(statement(b.description || b.headline, b.category));
+    addMedia("hero", "split", b.headline);
+    addFeature(0);
+    add(proofScene(b));
+    if (b.logos.length >= 3) add({ type: "logos", names: b.logos.slice(0, 6), beats: 2 });
+    add({ type: "marquee", text: b.name, beats: 1 });
+  } else if (grammar === "consumer") {
+    add(statement(b.headline || b.description, b.category));
+    addMedia("hero", "screen", b.headline);
+    addFeature(0);
+    addMedia("workflow", "scroll", features[1]?.title || b.headline);
+    addFeature(1);
+    if (features.length >= 3) add({ type: "featureStack", items: features.slice(0, 3).map((feature) => feature.title), beats: 2 });
+    add(proofScene(b));
+  } else if (grammar === "developer") {
+    add(statement(b.description || b.headline, b.category));
+    addMedia("workflow", "screen", features[0]?.title || b.headline);
+    addFeature(0);
+    add(proofScene(b));
+    addMedia("result", "scroll", features[1]?.title || b.headline);
+    addFeature(1);
+  } else {
+    add(statement(b.description || b.headline, b.category));
+    addMedia("hero", "screen", b.headline);
+    addFeature(0);
+    addMedia("workflow", "screen", features[1]?.title || b.headline);
+    addFeature(1);
+    add(proofScene(b));
   }
-  // transitions: keep only the LLM's accents; the style's primary covers the rest
-  const counts = {}; scenes.forEach((s) => s.transition && (counts[s.transition] = (counts[s.transition] || 0) + 1));
-  const filler = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
-  scenes.forEach((s) => { if (s.transition === filler) delete s.transition; });
-  const motionVariation = raw?.motion_variation || raw?.motionVariation || raw?.motion?.variation || decisions.motionVariation;
-  if (scenes.length < 12) return { ...fallbackPlan(brief, { ...decisions, motionVariation }), panel: raw?.panel || [], tagline: raw?.tagline };
-  if (scenes[0].type !== "coldopen") scenes.unshift({ type: "coldopen", word: brief.name });
-  scenes = scenes.filter((s, i) => s.type !== "endcard" || i === scenes.length - 1);
-  if (scenes[scenes.length - 1].type !== "endcard") scenes.push({ type: "endcard", text: raw?.tagline || brief.headline });
-  if (!scenes.some((s) => s.type === "cta")) scenes.splice(scenes.length - 1, 0, { type: "cta", text: "Try it today", button: "Get started" });
-  scenes = scenes.slice(0, 23).concat(scenes.length > 23 ? [scenes[scenes.length - 1]] : []);
-  const style = STYLES[decisions.style] ? decisions.style : "kinetic";
-  return { style, motionVariation, scenes, panel: (raw?.panel || []).slice(0, 4).map((p) => ({ role: clean(p.role, 30), note: clean(p.note, 260) })), tagline: clean(raw?.tagline, 60), title: clean(raw?.title, 60) };
+
+  if (!scenes.some((scene) => MEDIA_TYPES.has(scene.type)) && b.evidenceAssets.length) addMedia("hero", "screen", b.headline);
+  if (features.length >= 3 && !scenes.some((scene) => scene.type === "feature" && scene.index === 2)) addFeature(2);
+  if (scenes.length < 9 && b.description && !scenes.some((scene) => scene.type === "statement")) add(statement(b.description, b.category));
+  scenes.push({ type: "cta", text: cta.text, button: cta.button, beats: 1 });
+  scenes.push({ type: "endcard", text: b.tagline || b.headline || b.description || b.name, beats: 2 });
+  return {
+    style,
+    motionVariation: decisions.motionVariation || decisions.motion_variation || resolveMotionVariation(null, b, style).id,
+    grammar,
+    title: b.name,
+    tagline: b.tagline || b.headline || b.description,
+    panel: [{ role: "Evidence reader", note: `${b.evidenceAssets.length} visual states across ${b.pages.length || 1} page${(b.pages.length || 1) === 1 ? "" : "s"}; story grammar: ${grammar}.` }],
+    scenes: scenes.filter(Boolean).slice(0, 22).map((scene) => ({
+      ...scene,
+      duration: scene.duration || durationFor(scene.type, scene.beats),
+      motionIntent: scene.motionIntent || motionIntentFor(scene.type),
+    })),
+  };
+}
+
+/* ---------- sanitize provider output while retaining evidence ---------- */
+function matchingFeature(brief, scene, index) {
+  const features = publicBrief(brief).features;
+  const wanted = lower(scene.title || scene.text);
+  return features.find((feature) => wanted && (lower(feature.title) === wanted || lower(feature.title).includes(wanted) || wanted.includes(lower(feature.title)))) || features[index] || null;
+}
+
+function matchingAsset(brief, scene, type) {
+  const b = publicBrief(brief);
+  const pool = evidenceFromBrief(b);
+  const id = scene.asset_id || scene.assetId || scene.evidence_id || scene.evidenceId;
+  const byId = id ? pool.find((asset) => asset.id === id) : null;
+  const explicitUrl = publicUrl(scene.asset?.url || scene.asset?.src || scene.asset?.image);
+  const byObject = explicitUrl ? pool.find((asset) => asset.url === explicitUrl) : null;
+  const shot = Number.isInteger(Number(scene.shot)) ? pool.filter((asset) => asset.kind !== "image")[Number(scene.shot)] : null;
+  const desiredRole = lower(scene.assetRole || scene.asset_role || "");
+  const byRole = desiredRole ? pool.find((asset) => lower(asset.role) === desiredRole || lower(asset.pageRole) === desiredRole) : null;
+  const selected = byId || byObject || shot || byRole || pool.find((asset) => type === "scroll" ? asset.kind === "fullpage" : asset.kind !== "fullpage");
+  if (!selected || (type === "scroll" && selected.kind !== "fullpage")) return null;
+  return { ...selected, index: Math.max(0, b.screenshots.indexOf(selected.url)) };
+}
+
+function safeMotion(motion) {
+  if (!motion || typeof motion !== "object") return undefined;
+  const out = {};
+  ["entrance", "exit", "velocity", "sound"].forEach((key) => { if (typeof motion[key] === "string") out[key] = clean(motion[key], 32); });
+  ["anticipation", "overshoot", "settle", "hold"].forEach((key) => { if (Number.isFinite(Number(motion[key]))) out[key] = Math.max(0, Math.min(4, Number(motion[key]))); });
+  return Object.keys(out).length ? out : undefined;
+}
+
+function defaultBeats(type) {
+  return ["statement", "quote", "logos", "featureStack", "endcard"].includes(type) ? 2 : MEDIA_TYPES.has(type) ? 1 : 1;
+}
+
+function durationFor(type, beats) {
+  const bars = Number(beats);
+  if (Number.isFinite(bars) && bars > 0) return Math.round(Math.max(0.75, Math.min(5.25, bars * 1.5)) * 1000) / 1000;
+  return { screen: 2.25, scroll: 2.625, split: 2.25, quote: 2.25, endcard: 2.625, cta: 2.25 }[type] || 1.5;
+}
+
+function motionIntentFor(type) {
+  return { coldopen: "reveal", hook: "staccato", statement: "clarify", flashword: "impact", screen: "focus", scroll: "scan", feature: "reveal", featureStack: "cascade", stat: "count", quote: "settle", logos: "assemble", marquee: "glide", split: "compare", cta: "commit", endcard: "land" }[type] || "reveal";
+}
+
+function normalizeProviderScene(scene, index, brief, decisions) {
+  if (!scene || !SCENE_TYPES.includes(scene.type)) return null;
+  let type = scene.type;
+  const b = publicBrief(brief);
+  const out = { type };
+  if (TRANSITIONS.includes(scene.transition)) out.transition = scene.transition;
+  if (INTERACTIONS.includes(scene.interaction)) out.interaction = scene.interaction;
+  const beats = Number(scene.beats || scene.holdBeats || scene.hold_beats);
+  out.beats = Number.isFinite(beats) ? Math.max(0.5, Math.min(4, beats)) : defaultBeats(type);
+  const duration = Number(scene.duration ?? scene.durationSeconds);
+  out.duration = Number.isFinite(duration) && duration > 0 ? Math.max(0.75, Math.min(5.25, duration)) : durationFor(type, out.beats);
+  out.motionIntent = clean(scene.motionIntent || scene.motion_intent || scene.motion?.intent || motionIntentFor(type), 24);
+  out.motion = safeMotion(scene.motion);
+  if (!out.motion) delete out.motion;
+  switch (type) {
+    case "coldopen": out.word = clean(scene.word || b.name, 24); break;
+    case "hook": {
+      const words = Array.isArray(scene.words) ? scene.words : String(scene.words || scene.text || "").split(/\s+/);
+      out.words = words.map((word) => clean(word, 22)).filter(Boolean).slice(0, 4);
+      if (!out.words.length) out.words = String(decisions.hook || b.headline || b.name).split(/\s+/).slice(0, 4).map((word) => clean(word, 22));
+      break;
+    }
+    case "statement": out.text = clean(scene.text || b.description || b.headline, 70); out.accent = clean(scene.accent, 20); if (scene.kicker) out.kicker = clean(scene.kicker, 24); break;
+    case "flashword": out.word = clean(String(scene.word || scene.text || b.name).split(/\s+/)[0], 16); break;
+    case "screen": case "scroll": case "split": {
+      const asset = matchingAsset(b, scene, type);
+      if (!asset) return null;
+      if (type === "scroll" && asset.kind !== "fullpage") type = "screen";
+      out.type = type;
+      out.shot = asset.index;
+      out.src = asset.url;
+      out.asset = asset;
+      out.asset_id = asset.id;
+      out.assetRole = asset.role;
+      out.visualReason = clean(scene.visual_reason || scene.visualReason || `${asset.role} evidence from the ${asset.pageRole} page`, 140);
+      if (scene.caption) out.caption = clean(scene.caption, 34);
+      if (type === "split" && scene.text) out.text = clean(scene.text, 48);
+      if (type === "scroll") out.interaction = "scroll";
+      break;
+    }
+    case "feature": {
+      const feature = matchingFeature(b, scene, index);
+      if (!feature) return null;
+      out.title = clean(feature.title, 40); if (feature.desc) out.sub = clean(scene.sub || feature.desc, 70); if (scene.kicker) out.kicker = clean(scene.kicker, 24); out.index = b.features.indexOf(feature); break;
+    }
+    case "featureStack": {
+      const actual = b.features.map((feature) => feature.title);
+      const items = arrayOf(scene.items).map((item) => clean(typeof item === "string" ? item : item?.title, 26)).filter((item) => actual.some((fact) => lower(fact) === lower(item) || lower(fact).includes(lower(item))));
+      out.items = [...new Set(items)].slice(0, 3);
+      if (out.items.length !== 3 && actual.length >= 3) out.items = actual.slice(0, 3);
+      break;
+    }
+    case "stat": {
+      const stat = b.stats.find((item) => String(item.value) === String(scene.value)) || b.stats[index % Math.max(1, b.stats.length)];
+      if (!stat) return null;
+      out.value = clean(stat.value, 10); out.label = clean(scene.label || stat.label, 48); break;
+    }
+    case "quote": {
+      const quote = b.quotes.find((item) => lower(item.text) === lower(scene.text) || lower(item.text).includes(lower(scene.text || "")));
+      if (!quote) return null;
+      out.text = clean(quote.text, 120); out.author = clean(scene.author || quote.author, 40); break;
+    }
+    case "logos": {
+      const logos = b.logos;
+      out.names = arrayOf(scene.names).map((name) => clean(name, 18)).filter((name) => logos.some((logo) => lower(logo) === lower(name))).slice(0, 6);
+      if (out.names.length < 3 && logos.length >= 3) out.names = logos.slice(0, 6);
+      break;
+    }
+    case "marquee": out.text = clean(scene.text || b.name, 26); break;
+    case "cta": {
+      const cta = ctaFor(b);
+      out.text = clean(scene.text, 30) && !GENERIC_CTA.test(clean(scene.text, 30)) ? clean(scene.text, 30) : cta.text.slice(0, 30);
+      out.button = clean(scene.button, 22) && !GENERIC_CTA.test(clean(scene.button, 22)) ? clean(scene.button, 22) : cta.button.slice(0, 22);
+      break;
+    }
+    case "endcard": out.text = clean(scene.text || b.tagline || b.headline || b.name, 60); break;
+  }
+  if (out.interaction && !b.interactionTrace.some((event) => event.interaction === out.interaction) && out.interaction !== "none") out.interaction = "none";
+  if (out.type === "hook" && !out.words.length) return null;
+  if (out.type === "featureStack" && out.items.length !== 3) return null;
+  if (out.type === "logos" && out.names.length < 3) return null;
+  return out;
+}
+
+export function normalizePlan(raw, brief, decisions = {}) {
+  const b = publicBrief(brief);
+  const motionVariation = raw?.motion_variation || raw?.motionVariation || raw?.motion?.variation || decisions.motionVariation || resolveMotionVariation(null, b, decisions.style).id;
+  const incoming = arrayOf(raw?.scenes).map((scene, index) => normalizeProviderScene(scene, index, b, decisions)).filter(Boolean);
+  let scenes = incoming;
+  if (scenes.length < 8) return localPlan(b, { ...decisions, motionVariation });
+  if (scenes[0]?.type !== "coldopen") scenes.unshift({ type: "coldopen", word: b.name, beats: 1 });
+  scenes = scenes.filter((scene) => scene.type !== "endcard");
+  const ctaIndex = scenes.findIndex((scene) => scene.type === "cta");
+  const cta = ctaFor(b);
+  if (ctaIndex >= 0) { const scene = scenes.splice(ctaIndex, 1)[0]; scenes.push({ ...scene, type: "cta", text: scene.text || cta.text, button: scene.button || cta.button }); }
+  else scenes.push({ type: "cta", text: cta.text, button: cta.button, beats: 1 });
+  scenes.push({ type: "endcard", text: clean(raw?.tagline || b.tagline || b.headline || b.name, 60), beats: 2 });
+  scenes = scenes.slice(0, 22);
+  return {
+    style: STYLES[decisions.style] ? decisions.style : inferStyle(b),
+    motionVariation,
+    grammar: raw?.story_grammar || raw?.storyGrammar || decisions.grammar || chooseGrammar(b, decisions),
+    scenes,
+    panel: arrayOf(raw?.panel).slice(0, 4).map((panel) => ({ role: clean(panel?.role, 30), note: clean(panel?.note, 260) })).filter((panel) => panel.role || panel.note),
+    tagline: clean(raw?.tagline || b.tagline || b.headline, 60),
+    title: clean(raw?.title || b.name, 60),
+  };
 }
