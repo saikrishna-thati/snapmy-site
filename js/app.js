@@ -25,31 +25,67 @@ document.querySelectorAll("[data-plan]").forEach((b) => b.addEventListener("clic
 
 /* ---------------- sample films (hero + reel) ---------------- */
 function samplePlan(s) {
-  const b = s.brief; const f = b.features || []; const st2 = b.stats || [];
+  const b = s.brief;
+  if (Array.isArray(s.scenes) && s.scenes.length) {
+    return { style: s.style, motionVariation: s.motionVariation, direction: s.direction, structure: s.direction?.structure, scenes: s.scenes };
+  }
+  const f = b.features || []; const st2 = b.stats || [];
   const hookWords = (b.hook && b.hook.length ? b.hook : b.headline.split(/\s+/)).slice(0, 4);
   const scenes = [
     { type: "coldopen", word: b.name },
     { type: "hook", words: hookWords },
     { type: "statement", text: b.description, kicker: b.category || "Launch" },
     ...f.slice(0, 3).map((x, i) => ({ type: "feature", title: x.title, sub: x.desc, index: i, transition: i === 0 ? (STYLES[s.style].accents.includes("flash") ? "flash" : "zoom") : undefined })),
-    ...(f.length >= 3 ? [{ type: "featureStack", items: f.slice(0, 3).map((x) => x.title) }] : []),
     ...st2.slice(0, 2).map((x) => ({ type: "stat", value: x.value, label: x.label })),
-    { type: "marquee", text: b.name },
-    { type: "split", text: b.headline },
     { type: "cta", text: b.cta || "Get started", button: b.cta || "Get started" },
     { type: "endcard", text: b.description },
   ];
   return { style: s.style, motionVariation: s.motionVariation, scenes };
 }
-const briefOf = (s) => ({ ...s.brief, features: s.brief.features, colors: s.brief.colors, screenshots: [] });
+function placeholderShot(brief, variant) {
+  const b = brief || {};
+  const domain = String(b.domain || b.name || "product").replace(/^https?:\/\//, "");
+  const colors = (b.colors || []).filter((c) => /^#[0-9a-f]{3,8}$/i.test(c));
+  const accent = colors[0] || "#d97757";
+  const second = colors[1] || accent;
+  const bg = "#ffffff"; const ink = "#1b1b1d"; const muted = "#e7e5e0";
+  const brand = String(b.name || domain).slice(0, 18);
+  const full = variant === "fullpage";
+  const w = 1440, h = full ? 3200 : 900;
+  const chrome = `<rect width="${w}" height="64" fill="${muted}"/><circle cx="34" cy="32" r="7" fill="#d0cdc6"/><circle cx="58" cy="32" r="7" fill="#d0cdc6"/><circle cx="82" cy="32" r="7" fill="#d0cdc6"/><rect x="130" y="18" width="${w - 400}" height="28" rx="14" fill="#fff"/><rect x="${w - 210}" y="20" width="150" height="24" rx="12" fill="${accent}" opacity="0.9"/>`;
+  const header = full ? `<rect x="0" y="64" width="${w}" height="72" fill="#fff"/><text x="48" y="112" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="700" fill="${ink}">${brand}</text><rect x="${w - 320}" y="88" width="260" height="34" rx="17" fill="${accent}" opacity="0.85"/>` : "";
+  const side = `<rect x="0" y="${full ? 136 : 64}" width="280" height="${h - (full ? 136 : 64)}" fill="#faf9f6"/>${[0, 1, 2, 3, 4].map((i) => `<rect x="30" y="${(full ? 176 : 104) + i * 62}" width="220" height="22" rx="6" fill="${i === 0 ? accent : "#dedbd4"}" opacity="${i === 0 ? 1 : 0.85}"/>`).join("")}`;
+  const cards = [0, 1, 2].map((i) => {
+    const cx = 320 + i * 360; const cy = full ? 260 : 180;
+    return `<rect x="${cx}" y="${cy}" width="320" height="${full ? 260 : 210}" rx="18" fill="#fff" stroke="#e5e2dc"/><rect x="${cx + 24}" y="${cy + 28}" width="${full ? 180 : 150}" height="26" rx="8" fill="${accent}" opacity="0.9"/><rect x="${cx + 24}" y="${cy + 72}" width="220" height="14" rx="7" fill="#dedbd4"/><rect x="${cx + 24}" y="${cy + 100}" width="180" height="14" rx="7" fill="#dedbd4"/><rect x="${cx + 24}" y="${cy + 140}" width="120" height="34" rx="10" fill="${second}" opacity="0.85"/>`;
+  }).join("");
+  const rows = full ? Array.from({ length: 7 }, (_, i) => `<rect x="330" y="${640 + i * 300}" width="${w - 420}" height="${i % 2 ? 150 : 240}" rx="16" fill="${i % 2 ? "#f4f2ee" : "#fff"}" stroke="#e8e5df"/>`).join("") : "";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><rect width="${w}" height="${h}" fill="${bg}"/>${chrome}${header}${side}${cards}${rows}</svg>`;
+  return { url: "data:image/svg+xml;utf8," + encodeURIComponent(svg), width: w, height: h, fullPage: full, role: full ? "fullpage" : "hero" };
+}
+const shotCache = new Map();
+function sampleShots(s) {
+  if (!s || !s.brief) return [];
+  const key = s.brief.domain || s.brief.name || "sample";
+  if (shotCache.has(key)) return shotCache.get(key);
+  const shots = [placeholderShot(s.brief, "hero"), placeholderShot(s.brief, "fullpage")];
+  shotCache.set(key, shots);
+  return shots;
+}
+const briefOf = (s) => ({ ...s.brief, features: s.brief.features, colors: s.brief.colors, screenshots: (s.brief.screenshots && s.brief.screenshots.length) ? s.brief.screenshots : sampleShots(s) });
 
 async function heroInit() {
   const hp = $("heroPlayer"); if (!hp) return;
-  const s = SAMPLES[0];
+  const s = SAMPLES.find((x) => x.direction?.hero) || SAMPLES[0];
+  const aspect = s.aspect || "16:9";
   const brief = briefOf(s), plan = samplePlan(s);
-  const base = compose(brief, plan, { aspect: "16:9" });
+  const base = compose(brief, plan, { aspect });
   hp.setAttribute("srcdoc", base.html);
-  $("heroMeta").textContent = `Sample · ${brief.name} · ${STYLES[s.style].label}`;
+  hp.setAttribute("width", String(base.width));
+  hp.setAttribute("height", String(base.height));
+  const flagship = Boolean(s.direction?.hero);
+  const beat = s.direction?.beat ? ` · ${s.direction.beat}s` : "";
+  $("heroMeta").textContent = `${flagship ? "Flagship" : "Sample"} · ${brief.name} · ${STYLES[s.style].label}${beat}`;
   paintMini(base);
   hp.addEventListener("timeupdate", () => { const t = hp.currentTime || 0; $("heroTc").textContent = tc(t, true); $("heroHead").style.left = (100 * t) / base.duration + "%"; });
   let scored = false;
@@ -60,7 +96,7 @@ async function heroInit() {
     if (on && !scored) {
       scored = true;
       const sc = await renderScore({ scenes: base.scenes, cues: base.cues, duration: base.duration, style: s.style, energy: 2, soundProfile: base.soundProfile });
-      const withAudio = compose(brief, plan, { aspect: "16:9", audioSrc: sc.url });
+      const withAudio = compose(brief, plan, { aspect, audioSrc: sc.url });
       hp.setAttribute("srcdoc", withAudio.html);
       await once(hp, "ready", 8000); hp.muted = false; hp.play();
     } else hp.muted = !on;
@@ -76,16 +112,32 @@ function reelInit() {
   SAMPLES.forEach((s, i) => {
     const P = palette({ colors: s.brief.colors }, STYLES[s.style]);
     const aspect = s.aspect || "16:9";
+    const flagship = Boolean(s.direction?.hero);
     const fig = document.createElement("figure");
     fig.className = `fig fig--${aspect.replace(":", "-")}`;
-    fig.innerHTML = `<div class="frame" tabindex="0" role="button" aria-label="Play ${s.brief.name} sample"><div class="poster" style="--pbg:${P.bg};--pc:${P.field};--pfg:${P.fg}"><i></i><span class="poster-tag mono small">${STYLES[s.style].label} · ${s.note}</span><b>${s.brief.headline}</b></div><span class="poster-ratio mono small">${aspect}</span><span class="play-hint mono small">Play</span></div><figcaption><b>${s.brief.name}</b><span class="muted">${s.brief.domain}</span></figcaption>`;
+    fig.innerHTML = `<div class="frame" tabindex="0" role="button" aria-label="Play ${s.brief.name} sample" style="aspect-ratio:${aspect.replace(":", " / ")}"><div class="poster" style="--pbg:${P.bg};--pc:${P.field};--pfg:${P.fg}"><i></i><span class="poster-tag mono small">${STYLES[s.style].label} · ${s.note}</span><b>${s.brief.headline}</b></div><span class="poster-ratio mono small">${aspect}</span><span class="play-hint mono small">Play</span></div><figcaption><b>${s.brief.name}</b><span class="muted">${s.brief.domain}</span></figcaption>`;
     const frame = fig.querySelector(".frame");
+    if (flagship) frame.setAttribute("data-hero", "1");
+    const plan = samplePlan(s), brief = briefOf(s);
+    const verify = (comp) => {
+      import("./verify.js").then((m) => {
+        if (typeof m.verifyFilm !== "function") return;
+        const v = m.verifyFilm(brief, plan, comp);
+        if (!v || v.ok) return;
+        frame.setAttribute("data-verify", "fail");
+        console.warn(`[reel] ${s.brief.name} verification failed`, v.issues);
+      }).catch(() => {});
+    };
     const play = () => {
       if (active && active !== frame) { active.querySelector("hyperframes-player")?.remove(); active.classList.remove("playing"); }
       if (!frame.querySelector("hyperframes-player")) {
+        const comp = compose(brief, plan, { aspect });
         const p = document.createElement("hyperframes-player"); p.className = "hfp"; p.setAttribute("muted", ""); p.setAttribute("loop", ""); p.setAttribute("autoplay", "");
-        p.setAttribute("srcdoc", compose(briefOf(s), samplePlan(s), { aspect }).html); frame.prepend(p);
+        if (comp.width) p.setAttribute("width", String(comp.width));
+        if (comp.height) p.setAttribute("height", String(comp.height));
+        p.setAttribute("srcdoc", comp.html); frame.prepend(p);
         p.addEventListener("ready", () => frame.classList.add("playing"), { once: true });
+        verify(comp);
       } else { frame.classList.add("playing"); frame.querySelector("hyperframes-player").play?.(); }
       active = frame;
     };
@@ -94,6 +146,43 @@ function reelInit() {
     frame.addEventListener("click", () => openSample(s));
     reel.appendChild(fig);
   });
+}
+function reelSelfCheck() {
+  try {
+    const run = () => import("./verify.js").then((m) => {
+      if (typeof m.verifyReel !== "function") return;
+      const out = m.verifyReel(SAMPLES, (brief, plan, opts) => compose(brief, plan, opts || { aspect: "16:9" }));
+      const films = out?.films || [];
+      const uniq = new Set(films.map((f) => f.fingerprint || "").filter(Boolean)).size;
+      const issues = films.reduce((n, f) => n + (f.issues?.length || 0), 0);
+      const bad = films.filter((f) => (f.issues?.length || 0) > 0);
+      const dupNames = new Set((out?.duplicates || []).flatMap((d) => d.films || []));
+      if (out?.ok) {
+        console.info(`[reel] verified ${uniq}/${SAMPLES.length} unique, ${issues} issues`);
+        return;
+      }
+      bad.forEach((f) => {
+        const frames = SAMPLES.filter((s) => s.brief?.name === f.name);
+        frames.forEach((s) => {
+          const idx = SAMPLES.indexOf(s);
+          const frame = document.querySelectorAll("#reel .frame")[idx];
+          if (frame) frame.setAttribute("data-verify", "fail");
+        });
+      });
+      const dupOnly = [...dupNames].filter((n) => !bad.some((f) => f.name === n));
+      dupOnly.forEach((n) => {
+        const idx = SAMPLES.findIndex((s) => s.brief?.name === n);
+        const frame = document.querySelectorAll("#reel .frame")[idx];
+        if (frame) frame.setAttribute("data-verify", "fail");
+      });
+      const lines = [
+        ...bad.map((f) => `${f.name}: ${f.issues.join(" / ")}`),
+        ...(out?.duplicates || []).length ? [`duplicates: ${out.duplicates.map((d) => d.films.join("=")).join(" | ")}`] : [],
+      ];
+      console.error(`[reel] verifyReel FAILED (${uniq}/${SAMPLES.length} unique, ${issues} issues)\n` + lines.join("\n"));
+    }).catch(() => {});
+    if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 3000 }); else setTimeout(run, 800);
+  } catch (e) { console.warn("[reel] self-check skipped", e?.message); }
 }
 async function openSample(s) {
   const tok = ++st.token;
@@ -304,5 +393,5 @@ function normalizeUrl(v) { v = v.trim().replace(/^https?:\/\//i, ""); if (!v || 
 $("urlForm").addEventListener("submit", (e) => { e.preventDefault(); const u = normalizeUrl($("urlInput").value); if (!u) { $("formError").textContent = "Enter a website like yourproduct.com"; $("formError").hidden = false; return; } $("formError").hidden = true; run(u); });
 document.querySelectorAll(".try .chip").forEach((c) => c.addEventListener("click", () => { $("urlInput").value = c.dataset.url; run("https://" + c.dataset.url); }));
 
-customElements.whenDefined("hyperframes-player").then(() => { heroInit(); reelInit(); });
+customElements.whenDefined("hyperframes-player").then(() => { heroInit(); reelInit(); reelSelfCheck(); });
 refreshBackend();

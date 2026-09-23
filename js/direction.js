@@ -647,7 +647,7 @@ function localPlan(brief, decisions = {}) {
     addFeature(0);
     add(proofScene(b));
     if (b.logos.length >= 3) add({ type: "logos", names: b.logos.slice(0, 6), beats: 2 });
-    add({ type: "marquee", text: b.name, beats: 1 });
+    add(proofScene(b, b.stats.length ? 1 : 0));
   } else if (grammar === "consumer") {
     add(statement(b.headline || b.description, b.category));
     addMedia("hero", "screen", b.headline);
@@ -677,18 +677,60 @@ function localPlan(brief, decisions = {}) {
   if (scenes.length < 9 && b.description && !scenes.some((scene) => scene.type === "statement")) add(statement(b.description, b.category));
   scenes.push({ type: "cta", text: cta.text, button: cta.button, beats: 1 });
   scenes.push({ type: "endcard", text: b.tagline || b.headline || b.description || b.name, beats: 2 });
+  const final = scenes.filter(Boolean).slice(0, 22).map((scene) => ({
+    ...scene,
+    duration: scene.duration || durationFor(scene.type, scene.beats),
+    motionIntent: scene.motionIntent || motionIntentFor(scene.type),
+  }));
+  let media = final.filter((scene) => MEDIA_TYPES.has(scene.type));
+  if (media.length < 2) {
+    const promote = (index) => {
+      const scene = final[index];
+      if (scene) { scene.type = "screen"; scene.motionIntent = "focus"; }
+    };
+    const featureIndexes = final.map((scene, index) => (scene.type === "feature" ? index : -1)).filter((index) => index >= 0);
+    promote(featureIndexes[0]);
+    promote(featureIndexes[1] !== undefined ? featureIndexes[1] : final.findIndex((scene) => scene.type === "statement"));
+    media = final.filter((scene) => MEDIA_TYPES.has(scene.type));
+  }
+  if (!MEDIA_TYPES.has(final[0]?.type) && final[0]?.type === "coldopen") {
+    const swap = final.findIndex((scene, index) => index > 0 && (MEDIA_TYPES.has(scene.type) || scene.type === "hook" || scene.type === "statement"));
+    if (swap > 0) { const [moved] = final.splice(swap, 1); final.unshift(moved); }
+  }
+  final.length = Math.min(final.length, 20);
+  if (final[final.length - 1]?.type !== "endcard") final.push({ type: "endcard", text: b.tagline || b.headline || b.name, duration: durationFor("endcard", 2), motionIntent: "land" });
+  const deduped = [];
+  const seenTypes = new Set();
+  for (const scene of final) {
+    if (scene.type === "endcard") { continue; }
+    if (seenTypes.has(scene.type)) continue;
+    seenTypes.add(scene.type);
+    deduped.push(scene);
+  }
+  deduped.push({ type: "endcard", text: b.tagline || b.headline || b.name, duration: durationFor("endcard", 2), motionIntent: "land" });
+  const structure = deduped.map((scene) => scene.type);
+  const mediaBeats = structure.filter((type) => MEDIA_TYPES.has(type));
+  const seed = hashOf(`${b.domain}|${b.name}|${b.headline}`);
+  const cameras = ["push", "track", "orbit", "match", "reveal", "static"];
+  const holds = [mediaBeats[0] || structure[0]].concat(structure.includes("quote") ? ["quote"] : []).slice(0, 2);
   return {
     style,
     motionVariation: decisions.motionVariation || decisions.motion_variation || resolveMotionVariation(null, b, style).id,
     grammar,
     title: b.name,
     tagline: b.tagline || b.headline || b.description,
+    direction: {
+      concept: clean(b.headline || b.description || b.name, 160),
+      structure,
+      camera: cameras[seed % cameras.length],
+      opening: structure[0],
+      hero: false,
+      beat: 18 + (seed % 7),
+      holds,
+    },
+    structure,
     panel: [{ role: "Evidence reader", note: `${b.evidenceAssets.length} visual states across ${b.pages.length || 1} page${(b.pages.length || 1) === 1 ? "" : "s"}; story grammar: ${grammar}.` }],
-    scenes: scenes.filter(Boolean).slice(0, 22).map((scene) => ({
-      ...scene,
-      duration: scene.duration || durationFor(scene.type, scene.beats),
-      motionIntent: scene.motionIntent || motionIntentFor(scene.type),
-    })),
+    scenes: deduped,
   };
 }
 
@@ -734,6 +776,90 @@ function durationFor(type, beats) {
 
 function motionIntentFor(type) {
   return { coldopen: "reveal", hook: "staccato", statement: "clarify", flashword: "impact", screen: "focus", scroll: "scan", feature: "reveal", featureStack: "cascade", stat: "count", quote: "settle", logos: "assemble", marquee: "glide", split: "compare", cta: "commit", endcard: "land" }[type] || "reveal";
+}
+
+const PRODUCT_TYPES = ["screen", "scroll", "split", "flyin", "depthReveal", "matchcut", "track"];
+const CONTENT_OPENERS = ["flashword", "hook", "screen", "flyin", "depthReveal", "matchcut", "track"];
+const CAMERA_CHOICES = ["push", "track", "orbit", "match", "reveal", "static"];
+const STRUCTURE_LIMIT = 22;
+const PROMOTABLE_TYPES = ["feature", "statement", "featureStack"];
+
+function hashOf(value) {
+  let h = 2166136261;
+  const source = String(value ?? "");
+  for (let i = 0; i < source.length; i++) { h ^= source.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+function canonicalType(type) {
+  return type === "marquee" ? "statement" : type;
+}
+
+function retypeScene(scene, type, b) {
+  const next = { ...scene, type };
+  if (type === "marquee") return { ...next, type: "statement" };
+  const shot = Number.isInteger(Number(scene.shot)) ? Number(scene.shot) : 0;
+  if (PRODUCT_TYPES.includes(type)) {
+    next.shot = shot;
+    next.motionIntent = motionIntentFor(type);
+    next.duration = durationFor(type, next.beats);
+    if (type === "split" && !next.text) next.text = clean(b.headline || b.name, 48);
+    if (type === "depthReveal" && !next.text) next.text = clean(b.headline || b.name, 48);
+    if (type === "matchcut") { next.from = shot; next.to = shot; if (!next.text) next.text = clean(b.headline || b.name, 48); }
+    if ((type === "screen" || type === "flyin" || type === "track") && !next.caption) next.caption = clean(b.headline || b.name, 34);
+  } else if (type === "statement") {
+    if (!next.text) { next.text = clean(b.description || b.headline || b.name, 70); next.accent = ""; }
+  } else if (type === "feature") {
+    if (!next.title) next.title = clean(b.features[0]?.title || b.name, 40);
+  }
+  return next;
+}
+
+function enforceProductBeats(scenes, b) {
+  const productCount = () => scenes.filter((scene) => PRODUCT_TYPES.includes(scene.type)).length;
+  if (productCount() >= 2) return scenes;
+  for (let i = 0; i < scenes.length && productCount() < 2; i++) {
+    if (!PROMOTABLE_TYPES.includes(scenes[i].type)) continue;
+    const target = i % 2 ? "screen" : "scroll";
+    scenes[i] = retypeScene(scenes[i], target, b);
+  }
+  for (let i = 0; i < scenes.length && productCount() < 2; i++) {
+    if (scenes[i].type === "hook" || scenes[i].type === "flashword" || scenes[i].type === "quote") scenes[i] = retypeScene(scenes[i], "scroll", b);
+  }
+  return scenes;
+}
+
+function normalizeDirection(scenes, b, decisions) {
+  let cleaned = scenes.filter((scene) => scene.type !== "marquee").map((scene) => scene.type === "marquee" ? { ...scene, type: "statement" } : scene);
+  let statSeen = false;
+  cleaned = cleaned.filter((scene) => {
+    if (scene.type !== "stat") return true;
+    if (statSeen) return false;
+    statSeen = true;
+    return true;
+  });
+  if (cleaned[0]?.type === "coldopen") {
+    const shift = cleaned.findIndex((scene) => scene.type !== "coldopen");
+    if (shift > 0) {
+      const [opener] = cleaned.splice(shift, 1);
+      cleaned.unshift(opener);
+    } else if (cleaned[0]?.type === "coldopen") {
+      cleaned[0] = { type: "flashword", word: clean(cleaned[0]?.word || b.name, 16), beats: cleaned[0]?.beats || 1, duration: durationFor("flashword", cleaned[0]?.beats || 1), motionIntent: motionIntentFor("flashword") };
+    }
+  }
+  cleaned = cleaned.filter((scene, index) => scene && (index === 0 || scene.type !== cleaned[index - 1].type));
+  cleaned = enforceProductBeats(cleaned, b);
+  const structure = cleaned.map((scene) => scene.type);
+  const seed = hashOf(`${b.domain || b.name || "product"}|${b.headline || ""}|${decisions.style || ""}`);
+  const holds = PRODUCT_TYPES.filter((type) => structure.includes(type)).slice(0, 2);
+  const opening = CONTENT_OPENERS.includes(structure[0]) ? structure[0] : (structure.find((type) => CONTENT_OPENERS.includes(type)) || structure[0] || "screen");
+  const camera = CAMERA_CHOICES[seed % CAMERA_CHOICES.length];
+  const concept = clean(rawConcept(decisions) || b.headline || b.description || b.name, 160);
+  return { concept, structure, camera, opening, hero: false, beat: 16 + (seed % 19), holds };
+}
+
+function rawConcept(decisions) {
+  return clean(decisions.concept, 160);
 }
 
 function normalizeProviderScene(scene, index, brief, decisions) {
@@ -833,12 +959,15 @@ export function normalizePlan(raw, brief, decisions = {}) {
   if (ctaIndex >= 0) { const scene = scenes.splice(ctaIndex, 1)[0]; scenes.push({ ...scene, type: "cta", text: scene.text || cta.text, button: scene.button || cta.button }); }
   else scenes.push({ type: "cta", text: cta.text, button: cta.button, beats: 1 });
   scenes.push({ type: "endcard", text: clean(raw?.tagline || b.tagline || b.headline || b.name, 60), beats: 2 });
-  scenes = scenes.slice(0, 22);
+  scenes = scenes.slice(0, STRUCTURE_LIMIT);
+  const direction = normalizeDirection(scenes, b, decisions);
   return {
     style: STYLES[decisions.style] ? decisions.style : inferStyle(b),
     motionVariation,
     grammar: raw?.story_grammar || raw?.storyGrammar || decisions.grammar || chooseGrammar(b, decisions),
     scenes,
+    direction,
+    structure: direction.structure,
     panel: arrayOf(raw?.panel).slice(0, 4).map((panel) => ({ role: clean(panel?.role, 30), note: clean(panel?.note, 260) })).filter((panel) => panel.role || panel.note),
     tagline: clean(raw?.tagline || b.tagline || b.headline, 60),
     title: clean(raw?.title || b.name, 60),

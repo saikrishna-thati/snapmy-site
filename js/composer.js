@@ -82,11 +82,17 @@ export function resolveMotionVariation(value, brief = {}, style = "kinetic") {
   return MOTION_VARIATIONS[`mv${String((hash(key) % 100) + 1).padStart(3, "0")}`];
 }
 
-export const SCENE_TYPES = ["coldopen", "hook", "statement", "flashword", "screen", "scroll", "feature", "featureStack", "stat", "quote", "logos", "marquee", "split", "cta", "endcard"];
+export const SCENE_TYPES = ["coldopen", "hook", "statement", "flashword", "screen", "scroll", "feature", "featureStack", "stat", "quote", "logos", "marquee", "split", "cta", "endcard", "flyin", "depthReveal", "matchcut", "track"];
 
 // Product scenes share one browser window. Keeping this list deliberately small
 // means the rig only persists while the viewer is looking at the product world.
 const WINDOW_SCENE_TYPES = new Set(["screen", "scroll", "split"]);
+
+// Scenes that carry real product motion and may span several content beats inside one camera group.
+const CAMERA_SCENE_TYPES = new Set(["flyin", "track", "depthReveal", "matchcut"]);
+
+// Product-subject scene types used for the product-screen-time measurement.
+const PRODUCT_SCENE_TYPES = new Set(["screen", "scroll", "split", "flyin", "depthReveal", "matchcut", "track"]);
 
 // SFX cue each transition / scene type implies (consumed by the score engine)
 const TRANSITION_SFX = { whip: "swoosh_fast", zoom: "swoosh_air", flash: "rev_glass", wipe: "swoosh_mid", iris: "swoosh_low", glitch: "glitch", push: "swoosh_mid", cut: null, blocks: "swoosh_fast" };
@@ -176,49 +182,95 @@ function resolveAsset(value, assets = []) {
 function assignAssets(scenes, assets) {
   let previous = null;
   return scenes.map((scene, index) => {
-    const visual = ["screen", "scroll", "split"].includes(scene.type);
+    const visual = PRODUCT_SCENE_TYPES.has(scene.type);
     if (!visual) return { ...scene, asset: null };
-    const explicit = scene.asset ?? scene.src ?? (Number.isInteger(scene.shot) ? assets[scene.shot] : null);
+    const explicit = scene.asset ?? scene.src ?? (Number.isInteger(scene.shot) ? assets[scene.shot] : null)
+      ?? (Number.isInteger(scene.from) ? assets[scene.from] : null);
     const requested = resolveAsset(explicit, assets);
-    const candidates = assets.filter((a) => scene.type !== "scroll" || a.fullPage);
-    const reusable = Boolean(scene.allowRepeat || scene.matchCut || scene.holdAsset);
+    const preferred = assets.filter((a) => scene.type !== "scroll" || a.fullPage);
+    const candidates = preferred.length ? preferred : assets;
+    const cameraTreatment = scene.type === "matchcut" || scene.type === "track" || scene.type === "depthReveal" || scene.type === "flyin";
+    const reusable = Boolean(scene.allowRepeat || scene.matchCut || scene.holdAsset || cameraTreatment || scene.shot != null || scene.from != null);
     let asset = requested;
-    if (!asset && candidates.length) asset = candidates.find((a) => a.id !== previous) || (reusable ? candidates[0] : null);
-    if (asset && asset.id === previous && !reusable) {
+    const explicitMissing = !requested && explicit != null;
+    if (!asset && candidates.length) asset = candidates.find((a) => a.id !== previous) || candidates[0];
+    if (asset && asset.id === previous && !requested) {
       const alternate = candidates.find((a) => a.id !== previous);
-      asset = alternate || null;
+      if (alternate) asset = alternate;
+      else if (!reusable) asset = asset;
     }
-    if (scene.type === "scroll" && asset && !asset.fullPage && !scene.allowStillScroll) asset = null;
+    if (scene.type === "scroll" && asset && !asset.fullPage && !scene.allowStillScroll) {
+      const full = candidates.find((a) => a.fullPage);
+      asset = full || asset;
+    }
     if (asset) previous = asset.id;
     return { ...scene, asset };
   });
 }
 
+function assignMatchAssets(scenes, assets) {
+  return scenes.map((scene) => {
+    if (scene.type !== "matchcut") return scene;
+    const fromAsset = resolveAsset(scene.from != null ? scene.from : scene.asset, assets);
+    const toAsset = resolveAsset(scene.to != null ? scene.to : scene.matchTo, assets) || scene.asset || fromAsset;
+    return { ...scene, asset: scene.asset || fromAsset || toAsset, fromAsset, toAsset };
+  });
+}
+
 function shotTiming(scene, index, rand) {
-  const defaults = { coldopen: 1.5, hook: 1.125, statement: 1.5, flashword: 1.125, screen: 2.25, scroll: 2.625, feature: 1.5, featureStack: 1.875, stat: 1.875, quote: 2.25, logos: 1.5, marquee: 1.5, split: 2.25, cta: 2.25, endcard: 2.625 };
+  const defaults = { coldopen: 1.5, hook: 1.125, statement: 1.5, flashword: 1.125, screen: 2.75, scroll: 2.75, feature: 1.875, featureStack: 1.875, stat: 1.875, quote: 2.25, logos: 1.5, marquee: 1.5, split: 2.75, cta: 2.25, endcard: 2.625, flyin: 4.5, depthReveal: 3.75, matchcut: 3.75, track: 4.5 };
   const requested = Number(scene.duration ?? scene.durationSeconds ?? 0);
+  const quiet = Boolean(scene.quiet || scene.hold === true || scene.holdQuiet === true || scene.silent === true);
+  const longHold = Number(scene.hold ?? scene.holdDuration ?? 0);
+  if (quiet) {
+    const quietSpan = clamp(Math.round((longHold > 1.5 ? longHold : 5.5) / BEAT) * BEAT, Math.round(5.5 / BEAT) * BEAT, CUT * 4.4);
+    const entrance = BEAT * 0.7;
+    const followThrough = clamp(Number(scene.followThrough ?? scene.follow_through ?? 0.24), 0.08, 0.45);
+    const hold = clamp(Number(longHold > 1.5 ? longHold : quietSpan - entrance - followThrough), BEAT * 0.55, Math.max(BEAT * 0.55, quietSpan - BEAT * 0.3));
+    return { span: quietSpan, entrance, hold, followThrough, quiet: true };
+  }
+  const requestedSpan = requested > 0 ? Math.round(requested / BEAT) * BEAT : 0;
+  if (requestedSpan >= 5) {
+    const entrance = PRODUCT_SCENE_TYPES.has(scene.type) ? BEAT * 1.8 : BEAT * 1.2;
+    const followThrough = clamp(Number(scene.followThrough ?? scene.follow_through ?? 0.2), 0.08, 0.45);
+    const hold = clamp(Number(scene.hold ?? (requestedSpan - entrance - followThrough)), BEAT * 0.55, Math.max(BEAT * 0.55, requestedSpan - BEAT * 0.3));
+    return { span: requestedSpan, entrance, hold, followThrough, quiet: false };
+  }
   const variance = requested > 0 ? 0 : (index % 3 === 1 ? rand.range(-0.12, 0.12) : index % 3 === 2 ? rand.range(-0.08, 0.16) : 0);
   const raw = requested > 0 ? requested : (defaults[scene.type] || CUT) + variance;
-  const span = clamp(Math.round(raw / BEAT) * BEAT, BEAT * 3, CUT * 3.5);
-  const entrance = scene.type === "screen" || scene.type === "scroll" || scene.type === "split" ? BEAT * 1.8 : BEAT * 1.2;
+  const explicitHero = Boolean(scene.hero || scene.hold);
+  const span = clamp(Math.round(raw / BEAT) * BEAT, BEAT * 3, explicitHero ? CUT * 4.5 : CUT * 3.5);
+  const entrance = PRODUCT_SCENE_TYPES.has(scene.type) || scene.type === "screen" || scene.type === "scroll" || scene.type === "split" ? BEAT * 1.8 : BEAT * 1.2;
   const followThrough = clamp(Number(scene.followThrough ?? scene.follow_through ?? (scene.type === "cta" || scene.type === "endcard" ? 0.3 : 0.18)), 0.08, 0.45);
   const hold = clamp(Number(scene.hold ?? (span - entrance - followThrough)), BEAT * 0.55, Math.max(BEAT * 0.55, span - BEAT * 0.3));
-  return { span, entrance, hold, followThrough };
+  return { span, entrance, hold, followThrough, quiet: false };
 }
 
 function shotMotion(scene, index, type, motion, rand) {
-  const map = { coldopen: "reveal", hook: "staccato", statement: "clarify", flashword: "impact", screen: "focus", scroll: "scan", feature: "reveal", featureStack: "cascade", stat: "count", quote: "settle", logos: "assemble", marquee: "glide", split: "compare", cta: "commit", endcard: "land" };
+  const map = { coldopen: "reveal", hook: "staccato", statement: "clarify", flashword: "impact", screen: "focus", scroll: "scan", feature: "reveal", featureStack: "cascade", stat: "count", quote: "settle", logos: "assemble", marquee: "glide", split: "compare", cta: "commit", endcard: "land", flyin: "soar", depthReveal: "unveil", matchcut: "match", track: "truck" };
+  const q = Boolean(scene.quiet || scene.hold === true || scene.holdQuiet === true || scene.silent === true);
   const source = typeof scene.motion === "object" ? scene.motion : {};
   const intent = scene.motionIntent || scene.motion_intent || (typeof scene.motion === "string" ? scene.motion : source.intent) || map[type] || "reveal";
   const direction = Number(source.direction ?? scene.direction ?? ((index + (motion.camera === "orbit" ? 1 : 0)) % 2 ? 1 : -1)) < 0 ? -1 : 1;
   return {
     intent,
     direction,
+    quiet: q,
     anticipation: clamp(Number(source.anticipation ?? scene.anticipation ?? (intent === "impact" || intent === "commit" ? 0.16 : 0.08)), 0, 0.28),
-    overshoot: clamp(Number(source.overshoot ?? scene.overshoot ?? (intent === "land" || intent === "settle" ? 0.018 : 0.035)), 0, 0.08),
+    overshoot: q ? 0 : clamp(Number(source.overshoot ?? scene.overshoot ?? (intent === "land" || intent === "settle" ? 0.018 : 0.035)), 0, 0.08),
     followThrough: clamp(Number(source.followThrough ?? scene.followThrough ?? scene.follow_through ?? (intent === "glide" ? 0.24 : 0.16)), 0.08, 0.45),
-    tilt: clamp(Number(source.tilt ?? scene.tilt ?? (motion.tilt || 0) * 0.18 + rand.range(-0.3, 0.3)), -2.5, 2.5),
+    tilt: q ? 0 : clamp(Number(source.tilt ?? scene.tilt ?? (motion.tilt || 0) * 0.18 + rand.range(-0.3, 0.3)), -2.5, 2.5),
   };
+}
+
+function quietShotCode(id, t0, timing) {
+  const span = Math.max(BEAT, timing.span);
+  const hold = Math.max(BEAT, span - Math.min(0.9, span * 0.3));
+  return [
+    `tl.fromTo("#${id}-motion",{opacity:.82,scale:1.008},{opacity:1,scale:1,duration:${r3(Math.min(0.9, span * 0.3))},ease:"sine.out"},${r3(t0)});`,
+    `tl.to("#${id}-motion",{opacity:.9,scale:1.002,duration:${r3(Math.max(BEAT, hold * 0.42))},ease:"sine.inOut"},${r3(t0 + Math.min(0.9, span * 0.3))});`,
+    `tl.to("#${id}-motion",{opacity:1,scale:1,duration:${r3(Math.max(BEAT, hold * 0.58))},ease:"sine.inOut"},${r3(t0 + Math.min(0.9, span * 0.3) + hold * 0.42)});`,
+  ];
 }
 
 function effectPolicy(brief = {}, plan = {}, motion = {}, style = {}) {
@@ -360,6 +412,25 @@ function sceneBuilders(ctx) {
   const assetFor = (sc) => sc.asset || null;
   const hasFrame = (sc) => sc.browserFrame === true || (sc.browserFrame !== false && treatment.chrome);
   const chrome = () => `<div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>`;
+  const deviceMarkup = (id, asset, frame, top, className = "device-frame") => {
+    const body = asset?.url ? `<div class="shot" style="${assetStyle(asset, top)}"></div>` : `<div class="shot ghost" style="top:${top}px"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+    return `<div class="browser ${frame ? "" : "clean-browser"} ${className}" id="${id}-b">${frame ? chrome() : ""}${body}</div>`;
+  };
+  const cursorMarkup = (id, uu) => `<svg class="cursor rig-cursor" id="${id}-cur" viewBox="0 0 24 24" width="${Math.round(uu * 6)}" height="${Math.round(uu * 6)}"><path d="M4 2l16 9-7 2-3 7z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
+  const cursorPath = (id, t0, bounds, span) => {
+    const from = { x: -Math.round(W * 0.28), y: -Math.round(H * 0.24), rotate: -8 };
+    const to = bounds && Number.isFinite(bounds.x)
+      ? { x: bounds.x + bounds.w * 0.45 - W / 2, y: bounds.y + bounds.h * 0.42 - H / 2 }
+      : { x: Math.round(W * 0.06), y: Math.round(H * 0.08), rotate: 2 };
+    const start = t0 + Math.min(BEAT * 1.6, span * 0.2);
+    const travel = clamp(span * 0.34, 0.55, 1.5);
+    const settle = Math.min(0.24, span * 0.08);
+    return [
+      `tl.fromTo("#${id}-cur",{x:${from.x},y:${from.y},opacity:0,rotation:-8},{x:${Math.round(to.x * 0.92)},y:${Math.round(to.y * 0.94)},rotation:${to.rotate},opacity:1,duration:${r3(travel)},ease:"power2.inOut"},${r3(start)});`,
+      `tl.to("#${id}-cur",{x:${Math.round(to.x)},y:${Math.round(to.y)},rotation:${to.rotate},duration:${r3(settle)},ease:"power2.out"},${r3(start + travel)});`,
+      `tl.to("#${id}-cur",{y:${Math.round(to.y) + Math.round(u * 0.35)},duration:${r3(Math.min(0.26, span * 0.08))},ease:"power2.inOut"},${r3(start + travel + settle)});`,
+    ];
+  };
   const interactionCode = (sc, id, t0, type, asset) => {
     const mode = sc.interaction || (type === "scroll" ? "scroll" : type === "screen" ? motion.interaction : "none");
     const target = targetBounds(asset, sc, W, H);
@@ -459,14 +530,17 @@ function sceneBuilders(ctx) {
       return { html, code: [...code, ...interaction.code], hits: interaction.hits };
     },
     feature(sc, id, t0, idx) {
-      const n = String((sc.ordinal ?? sc.index ?? idx) + 1).padStart(2, "0");
+      const showNum = (ctx.featureCount || 0) > 1;
+      const ord = sc.ordinal != null ? sc.ordinal : (ctx.featureOrdinal != null ? ctx.featureOrdinal : (sc.index ?? idx));
+      const n = String((ord >= 0 ? ord : 0) + 1).padStart(2, "0");
       const title = up(clip(sc.title || sc.text, 40));
       const lines = wrap(title, portrait ? 12 : 20).slice(0, 3);
       const fs = fitSize(lines, innerW * (portrait ? 1 : 0.78), S.ratio, Math.round(H * (portrait ? 0.085 : 0.12)));
       const numFs = Math.round(H * (portrait ? 0.22 : 0.42));
-      const html = `<div class="cam left feat"><div class="num disp" id="${id}-n" style="font-size:${numFs}px">${n}</div><div class="ftext">${sc.kicker ? kicker(id, sc.kicker) : ""}${lines.map((l, i) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}${sc.sub ? `<p class="sub" id="${id}-s" style="font-size:${Math.round(u * 2.6)}px">${esc(clip(sc.sub, 80))}</p>` : ""}</div></div>`;
+      const num = showNum ? `<div class="num disp" id="${id}-n" style="font-size:${numFs}px">${n}</div>` : "";
+      const html = `<div class="cam left feat${showNum ? "" : " sonum"}">${num}<div class="ftext">${sc.kicker ? kicker(id, sc.kicker) : ""}${lines.map((l, i) => `<div class="mask"><div class="disp ln" style="font-size:${fs}px">${esc(l)}</div></div>`).join("")}${sc.sub ? `<p class="sub" id="${id}-s" style="font-size:${Math.round(u * 2.6)}px">${esc(clip(sc.sub, 80))}</p>` : ""}</div></div>`;
       const code = [
-        `tl.fromTo("#${id}-n",{yPercent:30,opacity:0},{yPercent:0,opacity:1,duration:.7,ease:"expo.out"},${r3(t0)});`,
+        showNum ? `tl.fromTo("#${id}-n",{yPercent:30,opacity:0},{yPercent:0,opacity:1,duration:.7,ease:"expo.out"},${r3(t0)});` : "",
         `tl.fromTo("#${id} .ln",{yPercent:112},{yPercent:0,duration:.5,ease:"expo.out",stagger:.07},${r3(t0 + BEAT * 0.5)});`,
         sc.kicker ? kickerIn(id, t0) : "",
         sc.sub ? `tl.fromTo("#${id}-s",{opacity:0,y:16},{opacity:1,y:0,duration:.45,ease:"power3.out"},${r3(t0 + BEAT * 2)});` : "",
@@ -560,6 +634,107 @@ function sceneBuilders(ctx) {
       ];
       return { html, code, hits: [{ t: t0 + Math.max(BEAT, active - BEAT * 0.9), sfx: "mouse_click_b", gain: 0.5 }] };
     },
+    flyin(sc, id, t0) {
+      const asset = assetFor(sc);
+      const frame = hasFrame(sc);
+      const fw = portrait ? W * 0.66 : W * 0.54;
+      const fh = fw * (portrait ? 1.25 : 0.62);
+      const active = Math.max(BEAT * 4, timing().span);
+      const flight = Math.max(2.5, active * 0.6);
+      const push = Math.max(BEAT * 3, active - flight - 0.4);
+      const pushAt = t0 + flight;
+      const cap = sc.caption ? `<div class="cap disp" id="${id}-cap" style="font-size:${Math.round(u * (portrait ? 6 : 5.2))}px">${esc(up(clip(sc.caption, 34)))}</div>` : "";
+      const bodyTop = frame ? Math.round(u * 4.4) : 0;
+      const body = asset?.url ? `<div class="shot" style="${assetStyle(asset, bodyTop)}"></div>` : `<div class="shot ghost" style="top:${bodyTop}px"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const mark = targetMarkup(id, asset, sc, W, H, u);
+      const html = `<div class="cam center persp rig-cam"><div class="fly-rig" id="${id}-rig"><div class="browser ${frame ? "" : "clean-browser"}" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame ? chrome() : ""}${body}${treatment.glare ? `<div class="glare" id="${id}-g"></div>` : ""}</div>${cursorMarkup(id, u)}</div>${cap}${mark}<div class="scrim" id="${id}-scrim"></div></div>`;
+      const code = [
+        `tl.set("#${id}-rig",{z:-1400,scale:.6,rotationX:18,rotationY:-8,opacity:0,transformPerspective:${Math.round(W * 1.4)}},${r3(t0 - BEAT * 0.5)});`,
+        `tl.to("#${id}-rig",{opacity:1,duration:.4,ease:"power2.out"},${r3(t0)});`,
+        `tl.fromTo("#${id}-rig",{z:-1400,scale:.6,rotationX:18,rotationY:-8,opacity:0},{z:-180,scale:.96,rotationX:4,rotationY:0,opacity:1,duration:${r3(flight)},ease:"power3.out"},${r3(t0)});`,
+        `tl.fromTo("#${id}-b",{rotateX:6,rotateY:-4},{rotateX:1,rotateY:0,duration:${r3(flight * 0.9)},ease:"power2.out"},${r3(t0 + 0.1)});`,
+        treatment.glare ? `tl.fromTo("#${id}-g",{xPercent:-130},{xPercent:130,duration:${r3(flight)},ease:"power2.inOut"},${r3(t0 + flight * 0.3)});` : "",
+        `tl.to("#${id}-rig",{z:40,scale:2.4,rotationX:0,rotateX:0,transformPerspective:${Math.round(W * 1.4)},duration:${r3(push)},ease:"power2.inOut"},${r3(pushAt)});`,
+        `tl.fromTo("#${id}-scrim",{opacity:0},{opacity:.5,duration:${r3(push * 0.55)},ease:"power2.in"},${r3(pushAt)});`,
+        `tl.fromTo("#${id}-b",{saturate:1,brightness:1},{brightness:1.05,duration:${r3(push * 0.4)},yoyo:true,repeat:1,ease:"power2.inOut"},${r3(pushAt + push * 0.3)});`,
+        sc.caption ? `tl.fromTo("#${id}-cap",{opacity:0,y:30},{opacity:1,y:0,duration:${r3(Math.min(.45, active * .25))},ease:"expo.out"},${r3(t0 + Math.min(flight * 0.8, active * .5))});` : "",
+        ...cursorPath(id, t0, targetBounds(asset, sc, W, H), active),
+      ];
+      const hits = [{ t: r3(t0 + 0.05), sfx: "swoosh_air", gain: 0.5 }, { t: r3(pushAt), sfx: "swoosh_fast", gain: 0.55 }];
+      const bounds = targetBounds(asset, sc, W, H);
+      if (bounds) hits.push({ t: r3(t0 + Math.min(BEAT * 1.6, active * 0.2) + clamp(active * 0.34, 0.55, 1.5)), sfx: "mouse_click_b", gain: 0.32 });
+      return { html, code, hits };
+    },
+    depthReveal(sc, id, t0) {
+      const asset = assetFor(sc);
+      const active = Math.max(BEAT * 3, timing().span);
+      const fw = portrait ? W * 0.9 : W * 0.74;
+      const fh = fw * (portrait ? 1.25 : 0.6);
+      const frame = hasFrame(sc);
+      const bodyTop = frame ? Math.round(u * 4.4) : 0;
+      const body = asset?.url ? `<div class="shot" style="${assetStyle(asset, bodyTop)}"></div>` : `<div class="shot ghost" style="top:${bodyTop}px"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const words = up(clip(sc.text || brief.headline || brief.name, 30));
+      const lines = wrap(words, portrait ? 10 : 14).slice(0, 3);
+      const maskTitle = `${lines.map((l) => esc(l)).join(" ")}`;
+      const mark = targetMarkup(id, asset, sc, W, H, u);
+      const html = `<div class="cam center persp depth-cam"><div class="depth-bg" id="${id}-bg">${asset?.url ? `<div class="shot" style="${assetStyle(asset)}"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`}</div>${frame ? `<div class="browser" id="${id}-b" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${chrome()}${body}</div>` : ""}<div class="depth-fg" id="${id}-fg"><h2 class="depth-type disp" style="font-size:${Math.round(u * (portrait ? 13 : 11))}px">${maskTitle}</h2><div class="depth-rule" id="${id}-rule"></div></div>${mark}${treatment.glare ? `<div class="glare" id="${id}-g"></div>` : ""}</div>`;
+      const code = [
+        `tl.fromTo("#${id}-bg",{scale:1.22,y:${Math.round(H * 0.04)}},{scale:1.02,y:0,duration:${r3(Math.max(BEAT, active * 0.8))},ease:"power2.out"},${r3(t0)});`,
+        `tl.to("#${id} .depth-type",{yPercent:7,duration:${r3(Math.max(BEAT, active * 0.7))},ease:"sine.inOut"},${r3(t0 + active * 0.28)});`,
+        `tl.fromTo("#${id}-fg",{clipPath:"inset(0% 0% 0% 0%)"},{clipPath:"inset(0% 0% 100% 0%)",duration:${r3(Math.min(0.7, active * 0.34))},ease:"power3.inOut"},${r3(t0 + active * 0.42)});`,
+        `tl.to("#${id}-fg",{y:${Math.round(-H * 0.14)},duration:${r3(Math.max(BEAT, active * 0.7))},ease:"power2.inOut"},${r3(t0 + active * 0.42)});`,
+        `tl.to("#${id}-bg",{scale:1.06,duration:${r3(Math.max(BEAT, active * 0.6))},ease:"sine.inOut"},${r3(t0 + active * 0.3)});`,
+        `tl.fromTo("#${id}-rule",{scaleX:0},{scaleX:1,duration:${r3(Math.min(0.6, active * 0.3))},ease:"expo.inOut"},${r3(t0 + 0.1)});`,
+        treatment.glare ? `tl.fromTo("#${id}-g",{xPercent:-130},{xPercent:130,duration:${r3(Math.min(1.1, active * 0.6))},ease:"power2.inOut"},${r3(t0 + Math.min(0.4, active * 0.15))});` : "",
+      ];
+      return { html, code, hits: [{ t: r3(t0 + active * 0.42), sfx: "swoosh_mid", gain: 0.42 }] };
+    },
+    matchcut(sc, id, t0) {
+      const from = sc.fromAsset || sc.matchFrom || assetFor(sc);
+      const to = sc.toAsset || sc.matchTo || from;
+      const active = Math.max(BEAT * 3, timing().span);
+      const cut = t0 + active * 0.5;
+      const shape = sc.shape === "rect" ? "inset" : "circle";
+      const clipFrom = shape === "rect" ? "inset(4% 6% 4% 6% round 28px)" : "circle(9% at 50% 50%)";
+      const clipTo = shape === "rect" ? "inset(0% 0% 0% 0% round 0px)" : "circle(86% at 50% 50%)";
+      const layerFrom = from?.url ? `<div class="shot match-a" style="${assetStyle(from)}"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const layerTo = to?.url ? `<div class="shot match-b" style="${assetStyle(to)}"></div>` : `<div class="shot ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const cap = sc.text ? `<div class="cap disp" id="${id}-cap" style="font-size:${Math.round(u * 5)}px">${esc(up(clip(sc.text, 34)))}</div>` : "";
+      const mark = targetMarkup(id, to || from, sc, W, H, u);
+      const html = `<div class="cam center persp match-wrap"><div class="match-stage" id="${id}-stage"><div class="match-layer match-out" id="${id}-out">${layerFrom}</div><div class="match-layer match-in" id="${id}-in">${layerTo}</div></div>${cap}${mark}<div class="match-flash" id="${id}-flash"></div></div>`;
+      const code = [
+        `tl.set("#${id}-in",{clipPath:${J(clipFrom)}},${r3(t0)});`,
+        `tl.fromTo("#${id}-out",{scale:1.14,filter:"blur(0px)"},{scale:1,filter:"blur(0px)",duration:${r3(active * 0.5)},ease:"power2.inOut"},${r3(t0)});`,
+        `tl.fromTo("#${id}-in",{clipPath:${J(clipFrom)}},{clipPath:${J(shape === "rect" ? "inset(0% 0% 0% 0% round 0px)" : "circle(46% at 50% 50%)")},duration:${r3(active * 0.32)},ease:"power2.inOut"},${r3(cut - active * 0.14)});`,
+        `tl.to("#${id}-in",{clipPath:${J(clipTo)},duration:${r3(active * 0.46)},ease:"power2.inOut"},${r3(cut + active * 0.04)});`,
+        `tl.to("#${id}-out",{scale:1.06,filter:"blur(2px)",duration:${r3(active * 0.46)},ease:"power2.inOut"},${r3(cut)});`,
+        `tl.fromTo("#${id}-stage",{scale:1},{scale:1.03,duration:${r3(active * 0.9)},ease:"sine.inOut"},${r3(t0)});`,
+        `tl.fromTo("#${id}-flash",{opacity:.42},{opacity:0,duration:.34,ease:"power2.out"},${r3(cut - 0.05)});`,
+        sc.text ? `tl.fromTo("#${id}-cap",{opacity:0,y:24},{opacity:1,y:0,duration:${r3(Math.min(.45, active * .22))},ease:"expo.out"},${r3(cut + active * 0.12)});` : "",
+      ];
+      return { html, code, hits: [{ t: r3(cut), sfx: "boom", gain: 0.45 }] };
+    },
+    track(sc, id, t0) {
+      const asset = assetFor(sc);
+      const frame = hasFrame(sc);
+      const active = Math.max(BEAT * 4, timing().span);
+      const gid = id;
+      const mark = targetMarkup(id, asset, sc, W, H, u);
+      const cap = sc.caption ? `<div class="track-cap disp" id="${id}-cap" style="font-size:${Math.round(u * 4.6)}px">${esc(up(clip(sc.caption, 34)))}</div>` : "";
+      const wide = asset?.url ? `<img class="track-img" id="${id}-img" src="${esc(asset.url)}" alt="" style="object-position:${Math.round(focalPoint(asset).x * 100)}% ${Math.round(focalPoint(asset).y * 100)}%">` : `<div class="shot ghost track-ghost"><div class="gh1"></div><div class="gh2"></div><div class="gh3"></div><div class="gh2"></div><div class="gh3"></div></div>`;
+      const html = `<div class="cam center track-cam"><div class="track-rig"><div class="track-stage" id="${id}-stage"><div class="browser track-browser ${frame ? "" : "clean-browser"}" id="${id}-b"><div class="track-band">${frame ? `<div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>` : ""}${wide}</div></div><div class="track-para" id="${id}-para"><div class="track-chip" style="font-size:${Math.round(u * 2.4)}px"><b></b>${esc(clip(sc.kicker || sc.label || cap ? (sc.kicker || sc.label || "") : (brief.category || brief.name || "Live view"), 28))}</div></div><div class="track-glare" id="${id}-glare"></div></div>${cap}${mark}${cursorMarkup(id, u)}</div>`;
+      const code = [
+        `tl.fromTo("#${id}-stage",{x:${Math.round(W * 0.02)},y:${Math.round(H * 0.03)},scale:1.02},{x:${-Math.round(W * 0.12)},y:0,scale:1.06,duration:${r3(active)},ease:"power1.inOut"},${r3(t0)});`,
+        `tl.fromTo("#${id}-img",{xPercent:0},{xPercent:-28,duration:${r3(active)},ease:"none"},${r3(t0)});`,
+        `tl.fromTo("#${id}-para",{x:${Math.round(W * 0.16)},y:${Math.round(-H * 0.04)}},{x:${-Math.round(W * 0.1)},y:${Math.round(H * 0.03)},duration:${r3(Math.max(BEAT, active * 0.95))},ease:"sine.inOut"},${r3(t0)});`,
+        `tl.fromTo("#${id}-glare",{xPercent:-140},{xPercent:120,duration:${r3(active * 0.7)},ease:"power2.inOut"},${r3(t0 + active * 0.2)});`,
+        sc.caption ? `tl.fromTo("#${id}-cap",{opacity:0,y:28},{opacity:1,y:0,duration:${r3(Math.min(.5, active * .22))},ease:"expo.out"},${r3(t0 + active * 0.3)});` : "",
+        ...cursorPath(id, t0, targetBounds(asset, sc, W, H), active),
+      ];
+      const hits = [{ t: r3(t0 + active * 0.3), sfx: "mouse_down", gain: 0.3 }];
+      if (targetBounds(asset, sc, W, H)) hits.push({ t: r3(t0 + Math.min(BEAT * 1.6, active * 0.2) + clamp(active * 0.34, 0.55, 1.5)), sfx: "ui_tick", gain: 0.28 });
+      return { html, code, hits };
+    },
     endcard(sc, id, t0, idx, isLast, total) {
       const name = brief.name || "Snapmy.site";
       const logoAsset = assetInfo(brief.logo, 0, "logo");
@@ -611,17 +786,75 @@ function planTransitions(scenes, S, rand, motion = {}, treatment = {}) {
   return out;
 }
 
-function planWindowGroups(scenes) {
-  const groups = [];
-  const isWindowScene = (scene) => WINDOW_SCENE_TYPES.has(scene.type) && Boolean(scene.asset?.url);
+const HARD_BREAK_SCENE_TYPES = new Set(["quote", "logos", "stat", "cta", "endcard"]);
+
+function isProductSceneBefore(scenes, i) {
+  const scene = scenes[i];
+  return Boolean(scene && PRODUCT_SCENE_TYPES.has(scene.type) && (scene.fromAsset?.url || scene.toAsset?.url || scene.asset?.url));
+}
+
+function planWindowGroups(scenes, motion = {}, timings = null) {
+  const isWindowScene = (scene) => Boolean(PRODUCT_SCENE_TYPES.has(scene.type) && (scene.fromAsset?.url || scene.toAsset?.url || scene.asset?.url));
+  const isHardBreak = (i) => HARD_BREAK_SCENE_TYPES.has(scenes[i]?.type);
+  const cameraMove = motion.camera === "push" || motion.camera === "track" || motion.camera === "orbit";
+  const spanFor = (g) => {
+    if (!timings) return 0;
+    const a = timings[g.start], b = timings[g.end];
+    return a && b ? b.end - a.t : 0;
+  };
+  const capacity = 12;
+  const runs = [];
   for (let i = 0; i < scenes.length;) {
     if (!isWindowScene(scenes[i])) { i++; continue; }
     const start = i;
-    while (i + 1 < scenes.length && isWindowScene(scenes[i + 1]) && i - start < 3) i++;
-    groups.push({ start, end: i });
-    i++;
+    let end = i;
+    while (end + 1 < scenes.length && !isHardBreak(end + 1)) end++;
+    end = Math.min(end, start + capacity - 1);
+    runs.push({ start, end });
+    i = end + 1;
   }
-  return groups;
+  const longestIndex = () => {
+    let best = -1, bestSpan = -1;
+    runs.forEach((r, k) => { const s = spanFor(r); if (s > bestSpan) { bestSpan = s; best = k; } });
+    return best;
+  };
+  const longest = () => {
+    const k = longestIndex();
+    return k === -1 ? 0 : spanFor(runs[k]);
+  };
+  if (timings && runs.length > 1) {
+    while (longest() < 6) {
+      let pick = -1, pickCost = Infinity;
+      for (let k = 0; k < runs.length - 1; k++) {
+        const a = runs[k], b = runs[k + 1];
+        if (b.start - a.end > 2) continue;
+        const cost = b.start - a.end;
+        if (cost < pickCost) { pickCost = cost; pick = k; }
+      }
+      if (pick === -1) break;
+      const absorbed = { start: runs[pick].start, end: runs[pick + 1].end };
+      if (absorbed.end - absorbed.start + 1 > capacity) break;
+      runs.splice(pick, 2, absorbed);
+    }
+  }
+  if (timings && runs.length) {
+    const k = longestIndex();
+    if (k !== -1) {
+      while (spanFor(runs[k]) < 6.5) {
+        const r = runs[k];
+        if (r.end + 1 >= scenes.length) break;
+        if (r.end - r.start + 2 > capacity) break;
+        r.end += 1;
+      }
+    }
+  }
+  return runs;
+}
+
+function windowGroupForScene(scenes, motion = {}, timings = null) {
+  const index = new Map();
+  planWindowGroups(scenes, motion, timings).forEach((g) => { for (let i = g.start; i <= g.end; i++) index.set(i, g); });
+  return index;
 }
 
 function waypointFor(index, W, motion = {}, asset = null, scene = {}, total = 1) {
@@ -646,6 +879,7 @@ function waypointFor(index, W, motion = {}, asset = null, scene = {}, total = 1)
 }
 
 function shotMotionCode(id, t0, timing, spec) {
+  if (spec.quiet) return quietShotCode(id, t0, timing);
   const dir = spec.direction || 1;
   const anticipation = Math.max(0.04, spec.anticipation || 0.08);
   const follow = Math.min(spec.followThrough || timing.followThrough || 0.16, Math.max(0.08, timing.span * 0.24));
@@ -661,31 +895,81 @@ function shotMotionCode(id, t0, timing, spec) {
 }
 
 /* ---------------- plan fallback (no LLM) ---------------- */
+const FALLBACK_STRUCTURES = [
+  ["screen", "statement", "scroll", "feature", "stat", "split", "cta", "endcard"],
+  ["flyin", "hook", "feature", "depthReveal", "featureStack", "cta", "endcard"],
+  ["scroll", "flashword", "matchcut", "feature", "quote", "track", "cta", "endcard"],
+  ["depthReveal", "statement", "feature", "stat", "flyin", "featureStack", "cta", "endcard"],
+  ["track", "hook", "feature", "split", "quote", "screen", "cta", "endcard"],
+  ["split", "flashword", "scroll", "stat", "feature", "matchcut", "cta", "endcard"],
+  ["matchcut", "statement", "flyin", "featureStack", "quote", "depthReveal", "cta", "endcard"],
+  ["flyin", "hook", "scroll", "feature", "matchcut", "quote", "cta", "endcard"],
+];
+const FALLBACK_PRODUCT_TYPES = ["screen", "scroll", "split", "flyin", "depthReveal", "matchcut", "track"];
+const FALLBACK_CONTENT_TYPES = ["hook", "statement", "flashword", "feature", "featureStack", "quote", "logos"];
 export function fallbackPlan(brief, decisions = {}) {
   const f = (brief.features || []).map((x) => (typeof x === "string" ? { title: x } : x)).filter((x) => x.title);
   const stats = (brief.stats || []).filter((s) => s.value);
   const quotes = (brief.quotes || []).filter((q) => q.text);
+  const logos = (brief.logos || []).filter(Boolean);
   const assets = collectAssets(brief);
-  const hasFullpage = assets.some((a) => a.fullPage);
-  const hook = String(decisions.hook || brief.hookCandidates?.[0] || brief.headline || brief.name).split(/\s+/).filter(Boolean).slice(0, 4);
-  const mode = hash(`${brief.domain || brief.name || "product"}:${decisions.style || "kinetic"}`) % 3;
+
+  const given = (Array.isArray(decisions.structure) ? decisions.structure : []).filter((k) => SCENE_TYPES.includes(k));
+  const key = `${brief.domain || brief.name || "product"}:${brief.name || ""}`;
+  const mixed = (hash(brief.domain || brief.name || "product") ^ (hash(brief.name || "") << 1) ^ (hash(brief.headline || brief.description || "") << 2)) >>> 0;
+  const bankIndex = mixed % FALLBACK_STRUCTURES.length;
+  const structure = (given.length ? given.slice() : FALLBACK_STRUCTURES[bankIndex].slice())
+    .filter((t, i, a) => t !== "marquee" && a.indexOf(t) === i)
+    .filter((t) => (t === "stat" ? stats.length > 0 : t === "quote" ? quotes.length > 0 : t === "logos" ? logos.length >= 3 : t === "featureStack" ? f.length >= 2 : true));
+  if (!structure.some((t) => FALLBACK_PRODUCT_TYPES.includes(t))) structure.splice(Math.min(1, structure.length), 0, FALLBACK_PRODUCT_TYPES[hash(`${key}:p`) % FALLBACK_PRODUCT_TYPES.length]);
+  if (structure.filter((t) => t === "stat").length > 1) { let seen = false; for (let i = structure.length - 1; i >= 0; i--) { if (structure[i] === "stat") { if (seen) structure.splice(i, 1); seen = true; } } }
+  if (!structure.length || structure[0] === "endcard") structure.unshift(FALLBACK_PRODUCT_TYPES[hash(`${key}:o`) % FALLBACK_PRODUCT_TYPES.length]);
+  if (!structure.includes("cta")) structure.push("cta");
+  if (structure[structure.length - 1] !== "endcard") structure.push("endcard");
+
+  const hook = String(decisions.hook || brief.hookCandidates?.[0] || brief.headline || brief.name || "").split(/\s+/).filter(Boolean).slice(0, 4);
+  const pathName = String(brief.domain || brief.name || "product").split(/[./]/)[0] || "product";
+  const withUrl = assets.filter((a) => a.url);
+  const pathAsset = withUrl.length ? withUrl[hash(`${key}:a`) % withUrl.length] : null;
+  const pathScroll = withUrl.find((a) => a.fullPage) || pathAsset;
+  const productAsset = (n) => withUrl.length ? withUrl[(hash(`${key}:${n}`) + n) % withUrl.length] : null;
+  let featAt = 0, prodAt = 0, statAt = 0;
+  const feat = () => ({ type: "feature", title: f[featAt]?.title || brief.headline || brief.name || pathName, sub: f[featAt]?.desc, index: featAt++, motionIntent: "reveal" });
   const S = [];
-  S.push({ type: "coldopen", word: brief.name });
-  if (mode !== 2) S.push({ type: "hook", words: hook, motionIntent: "staccato" });
-  if (brief.description || brief.headline) S.push({ type: "statement", text: brief.description || brief.headline, kicker: brief.category || "", accent: "" });
-  if (mode === 1 && brief.headline) S.push({ type: "flashword", word: brief.headline.split(/\s+/).sort((a, b) => b.length - a.length)[0], motionIntent: "impact" });
-  if (assets.length) S.push({ type: "screen", asset: assets[0], caption: clip(brief.headline, 34), motionIntent: "focus" });
-  f.slice(0, mode === 0 ? 2 : 3).forEach((x, i) => S.push({ type: "feature", title: x.title, sub: x.desc, index: i, motionIntent: i % 2 ? "clarify" : "reveal" }));
-  if (hasFullpage) S.push({ type: "scroll", asset: assets.find((a) => a.fullPage), motionIntent: "scan" });
-  else if (assets.length > 1) S.push({ type: "split", asset: assets[1], text: brief.headline, motionIntent: "compare" });
-  if (f.length >= 3 && mode === 2) S.push({ type: "featureStack", items: f.slice(0, 3).map((x) => x.title), motionIntent: "cascade" });
-  if (stats.length) S.push({ type: "stat", value: stats[0].value, label: stats[0].label, motionIntent: "count" });
-  if (quotes[0] && mode !== 0) S.push({ type: "quote", text: quotes[0].text, author: quotes[0].author, motionIntent: "settle" });
-  if ((brief.logos || []).length >= 3 && mode === 0) S.push({ type: "logos", names: brief.logos.slice(0, 6), motionIntent: "assemble" });
-  if (mode === 1 && brief.name) S.push({ type: "marquee", text: brief.name, duration: 1.125, motionIntent: "glide" });
-  S.push({ type: "cta", text: brief.cta || brief.tagline || brief.headline, button: brief.ctaLabel || brief.cta_text, motionIntent: "commit" });
-  S.push({ type: "endcard", text: brief.tagline || brief.headline, motionIntent: "land" });
-  return { style: decisions.style || "kinetic", motionVariation: decisions.motionVariation || decisions.motion_variation || decisions.motion?.variation, scenes: S.slice(0, 24), panel: [] };
+  structure.forEach((type, i) => {
+    if (type === "screen") { S.push({ type: "screen", asset: productAsset(prodAt++) || undefined, caption: clip(brief.headline, 34), motionIntent: "focus" }); return; }
+    if (type === "scroll") { S.push({ type: "scroll", asset: pathScroll || undefined, caption: clip(brief.headline, 34), motionIntent: "scan" }); return; }
+    if (type === "split") { S.push({ type: "split", asset: productAsset(prodAt++) || undefined, text: brief.headline, motionIntent: "compare" }); return; }
+    if (type === "flyin") { S.push({ type: "flyin", asset: productAsset(prodAt++) || undefined, caption: clip(brief.headline, 34), motionIntent: "soar" }); return; }
+    if (type === "depthReveal") { S.push({ type: "depthReveal", asset: productAsset(prodAt++) || undefined, text: brief.headline || brief.name, motionIntent: "unveil" }); return; }
+    if (type === "matchcut") { S.push({ type: "matchcut", asset: productAsset(prodAt++) || undefined, text: clip(brief.headline, 34), motionIntent: "match" }); return; }
+    if (type === "track") { S.push({ type: "track", asset: productAsset(prodAt++) || undefined, caption: clip(brief.headline, 34), motionIntent: "truck" }); return; }
+    if (type === "hook") { S.push({ type: "hook", words: hook.length ? hook : [brief.name || pathName], motionIntent: "staccato" }); return; }
+    if (type === "statement") { S.push({ type: "statement", text: brief.description || brief.headline || brief.name || pathName, kicker: brief.category || "", motionIntent: "clarify" }); return; }
+    if (type === "flashword") { S.push({ type: "flashword", word: String(brief.headline || brief.name || pathName).split(/\s+/).sort((a, b) => b.length - a.length)[0], motionIntent: "impact" }); return; }
+    if (type === "quote") { S.push({ type: "quote", text: quotes[0]?.text || brief.headline || brief.name, author: quotes[0]?.author, motionIntent: "settle" }); return; }
+    if (type === "stat") { S.push({ type: "stat", value: stats[statAt]?.value || "10x", label: stats[statAt]?.label || brief.category, motionIntent: "count" }); statAt++; return; }
+    if (type === "logos") { S.push({ type: "logos", names: logos.slice(0, 6), motionIntent: "assemble" }); return; }
+    if (type === "featureStack") { S.push({ type: "featureStack", items: (f.length ? f : [{ title: brief.headline || brief.name || pathName }]).slice(0, 3).map((x) => x.title), motionIntent: "cascade" }); return; }
+    if (type === "feature") { S.push(feat()); return; }
+    if (type === "cta") { S.push({ type: "cta", text: brief.cta || brief.tagline || brief.headline, button: brief.ctaLabel || brief.cta_text, motionIntent: "commit" }); return; }
+    if (type === "coldopen") { S.push({ type: "coldopen", word: brief.name }); return; }
+    if (type === "endcard") { S.push({ type: "endcard", text: brief.tagline || brief.headline || brief.name, motionIntent: "land" }); }
+  });
+  if (!S.length) S.push({ type: "screen", asset: pathAsset || undefined, caption: clip(brief.headline, 34), motionIntent: "focus" });
+  if (S[S.length - 1].type !== "endcard") S.push({ type: "endcard", text: brief.tagline || brief.headline || brief.name, motionIntent: "land" });
+  const style = decisions.style || "kinetic";
+  const cameraSeed = hash(`${key}:cam`) % ["push", "track", "orbit", "match", "reveal", "static"].length;
+  const direction = {
+    concept: `A ${style} product film for ${brief.name || pathName} that opens on real content and builds through its strongest beats.`,
+    structure: S.map((s) => s.type),
+    camera: ["push", "track", "orbit", "match", "reveal", "static"][cameraSeed],
+    opening: S[0].type,
+    hero: S.some((s) => s.asset?.url),
+    beat: decisions.beat || 20,
+    holds: [S.find((s) => FALLBACK_PRODUCT_TYPES.includes(s.type))?.type].filter(Boolean),
+  };
+  return { style, motionVariation: decisions.motionVariation || decisions.motion_variation || decisions.motion?.variation, scenes: S.slice(0, 24), structure: direction.structure, direction, panel: [] };
 }
 
 /* ---------------- main composer ---------------- */
@@ -702,31 +986,80 @@ export function compose(brief, plan, opts = {}) {
   const treatment = effectPolicy(brief, plan, motion, S);
   const assetPool = collectAssets(brief);
   let scenes = (plan.scenes || []).filter((s) => SCENE_TYPES.includes(s.type));
+  const structure = (Array.isArray(plan.structure) ? plan.structure : []).filter((k) => SCENE_TYPES.includes(k));
   if (!scenes.length) scenes = fallbackPlan(brief, { style: styleKey, motionVariation: motion.id }).scenes;
+  if (structure.length) {
+    const pool = scenes.slice();
+    const ordered = [];
+    structure.forEach((type) => {
+      const at = pool.findIndex((s) => s.type === type);
+      if (at !== -1) ordered.push(pool.splice(at, 1)[0]);
+    });
+    if (ordered.length) scenes = ordered;
+  }
+  if (!scenes.length) scenes = [{ type: "statement", text: brief.headline || brief.name }];
   if (scenes[scenes.length - 1].type !== "endcard") scenes.push({ type: "endcard" });
+  const featureCount = scenes.filter((s) => s.type === "feature").length;
   { let k = 0; scenes = scenes.map((s) => (s.type === "feature" ? { ...s, ordinal: k++ } : s)); }
-  scenes = assignAssets(scenes, assetPool).map((scene) => {
-    if (["screen", "scroll", "split"].includes(scene.type) && !scene.asset) {
-      return { ...scene, type: "statement", text: scene.text || brief.headline || brief.description || brief.name, kicker: scene.kicker || "", motionIntent: scene.motionIntent || "clarify" };
-    }
-    return scene;
-  });
+  scenes = assignAssets(scenes, assetPool);
+  scenes = assignMatchAssets(scenes, assetPool);
+  const direction = plan.direction && typeof plan.direction === "object" ? plan.direction : {};
+  const holds = Array.isArray(direction.holds) ? direction.holds.filter((k) => typeof k === "string") : [];
+  if (holds.length) scenes = scenes.map((s) => holds.includes(s.type) ? { ...s, quiet: true, holdQuiet: true } : s);
+  if (holds.length && !scenes.some((s) => Number(s.hold) > 1.5)) {
+    const firstHeld = scenes.findIndex((s) => holds.includes(s.type));
+    if (firstHeld !== -1) scenes[firstHeld] = { ...scenes[firstHeld], hold: 5.5 };
+  }
   const N = scenes.length;
   const timings = [];
+  const prevAssets = [];
   let cursor = 0;
-  scenes.forEach((scene, i) => { const timing = shotTiming(scene, i, rand); const t = cursor; timings.push({ ...timing, t, end: t + timing.span }); cursor += timing.span; });
-  const duration = r3(cursor + 0.42); // a small breathing tail after the last hold
-  const ctx = { W, H, P, S, brief, u, portrait, dir: 1, motion, treatment };
+  scenes.forEach((scene, i) => { const timing = shotTiming(scene, i, rand); const t = cursor; prevAssets.push(scene.fromAsset || scene.asset || null); timings.push({ ...timing, t, end: t + timing.span }); cursor += timing.span; });
+  const heroAt = timings.findIndex((x) => x.span >= 5);
+  if (heroAt === -1) {
+    const namedHero = holds.length ? scenes.findIndex((s) => s.type === holds[0]) : -1;
+    const productIdx = scenes.map((s, i) => ({ i, s })).filter(({ s }) => PRODUCT_SCENE_TYPES.has(s.type) && s.asset?.url).sort((a, b) => b.s.asset?.url.length - a.s.asset?.url.length)[0]?.i;
+    const mid = Math.floor((N - 1) / 2);
+    const pick = namedHero !== -1 ? namedHero : productIdx != null ? productIdx : mid;
+    const base = shotTiming({ ...scenes[pick], quiet: true, hold: 5.5 }, pick, rand);
+    timings[pick] = { ...timings[pick], ...base };
+    let acc = 0;
+    for (let i = 0; i < N; i++) { timings[i] = { ...timings[i], t: acc, end: acc + timings[i].span }; acc = timings[i].end; }
+  }
+  const productBlocks = () => {
+    const blocks = [];
+    for (let i = 0; i < N;) {
+      if (!isProductSceneBefore(scenes, i)) { i++; continue; }
+      const start = i;
+      let span = 0;
+      while (i < N && isProductSceneBefore(scenes, i)) { span += timings[i].span; i++; }
+      blocks.push({ start, end: i - 1, span });
+    }
+    return blocks;
+  };
+  let prodBlocks = productBlocks();
+  if (prodBlocks.length && Math.max(...prodBlocks.map((b) => b.span)) < 6) {
+    const target = prodBlocks.slice().sort((a, b) => b.span - a.span)[0];
+    const need = 6 - target.span;
+    const grow = target.span >= 5 ? target.start : target.end;
+    const extra = Math.ceil((need + 0.3) / BEAT) * BEAT;
+    const quietBase = shotTiming({ ...scenes[grow], quiet: true, hold: timings[grow].span + extra }, grow, rand);
+    timings[grow] = { ...timings[grow], ...quietBase };
+    let acc = 0;
+    for (let i = 0; i < N; i++) { timings[i] = { ...timings[i], t: acc, end: acc + timings[i].span }; acc = timings[i].end; }
+  }
+  const duration = r3(timings[N - 1].end + 0.42);
+  const ctx = { W, H, P, S, brief, u, portrait, dir: 1, motion, treatment, prevAssets, featureCount, featureOrdinal: 0 };
   const B = sceneBuilders(ctx);
   const trans = planTransitions(scenes, S, rand, motion, treatment);
-  const windowGroups = planWindowGroups(scenes);
-  const windowGroupAt = new Map();
-  windowGroups.forEach((g) => { for (let i = g.start; i <= g.end; i++) windowGroupAt.set(i, g); });
+  const windowGroups = planWindowGroups(scenes, motion, timings);
+  const windowGroupAt = windowGroupForScene(scenes, motion, timings);
   const code = [];
   const cues = []; // for the score engine
   const sceneMeta = [];
   let html = "";
   const OV = 0.3; // overlap around each cut for transitions
+  const isProductScene = (i) => isProductSceneBefore(scenes, i);
   let windowGroupIndex = 0;
   scenes.forEach((sc, i) => {
     const id = `s${i}`; const shotPlan = timings[i]; const t0 = shotPlan.t;
@@ -734,17 +1067,25 @@ export function compose(brief, plan, opts = {}) {
     const LEAD = { whip: 0.02, zoom: 0.04, flash: 0, wipe: 0.18, iris: 0.2, push: 0.2, glitch: 0.03, blocks: 0, cut: 0 };
     const group = windowGroupAt.get(i);
 
-    if (group) {
+    if (group && isProductScene(i)) {
       if (i !== group.start) return;
       const gid = `wg${windowGroupIndex++}`;
       const groupParts = [];
-      const groupStart = timings[group.start].t;
       const groupEnd = group.end === N - 1 ? duration : timings[group.end].end + OV;
       const fw = portrait ? W * 0.9 : W * 0.74;
       const fh = fw * (portrait ? 1.25 : 0.6);
+      const memberIndices = [];
+      const wpIndex = new Map();
 
       ctx.windowed = true;
       for (let j = group.start; j <= group.end; j++) {
+        const member = scenes[j];
+        if (!isProductScene(j)) continue;
+        memberIndices.push(j);
+        wpIndex.set(j, memberIndices.length - 1);
+      }
+      const groupStart = memberIndices.length ? timings[memberIndices[0]].t : timings[group.start].t;
+      memberIndices.forEach((j) => {
         const member = scenes[j];
         const memberId = `s${j}`;
         const memberTiming = timings[j];
@@ -752,37 +1093,46 @@ export function compose(brief, plan, opts = {}) {
         ctx.timing = memberTiming;
         ctx.motionSpec = shotMotion(member, j, member.type, motion, rand);
         const built = B[member.type](member, memberId, memberT, j, j === N - 1, duration);
-        const wp = waypointFor(j - group.start, W, motion, member.asset, member, group.end - group.start + 1);
-        groupParts.push(`<div id="${memberId}" class="window-shot" data-motion-intent="${esc(ctx.motionSpec.intent)}" style="--wx:${wp.x}px;--wy:${wp.y}px;--wz:${wp.z}px;--ws:${wp.scale};opacity:${j === group.start ? 1 : 0}"><div class="sc" id="${memberId}-sc"><div class="motion-stage" id="${memberId}-motion">${built.html}</div></div></div>`);
+        const wp = waypointFor(wpIndex.get(j), W, motion, member.asset, member, memberIndices.length);
+        groupParts.push(`<div id="${memberId}" class="window-shot" data-motion-intent="${esc(ctx.motionSpec.intent)}" data-quiet="${memberTiming.quiet ? 1 : 0}" style="--wx:${wp.x}px;--wy:${wp.y}px;--wz:${wp.z}px;--ws:${wp.scale};opacity:${j === memberIndices[0] ? 1 : 0}"><div class="sc" id="${memberId}-sc"><div class="motion-stage" id="${memberId}-motion">${built.html}</div></div></div>`);
         code.push(`// ${j} ${member.type} · persistent window`, ...built.code.filter(Boolean), ...shotMotionCode(memberId, memberT, memberTiming, ctx.motionSpec));
         (built.hits || []).forEach((h) => cues.push({ ...h, scene: j }));
         sceneMeta.push({ i: j, type: member.type, t: memberT, duration: memberTiming.span, hold: memberTiming.hold, asset: member.asset?.id || null, motion: ctx.motionSpec.intent, transition: j === group.start ? trans[j] : "camera", label: sceneLabel(member) });
-        if (j > group.start) {
+        if (wpIndex.get(j) > 0) {
           cues.push({ t: memberT, gain: 0.62, scene: j, transition: "camera", bridge: true });
         }
-      }
+      });
       ctx.windowed = false;
 
       const start = group.start === 0 ? 0 : Math.max(0, groupStart - (LEAD[trans[group.start]] ?? 0));
-      const rigId = windowGroupIndex === 1 ? "camera-rig" : `${gid}-camera-rig`;
-      const shots = group.end - group.start + 1;
+      const rigId = `${gid}-rig`;
+      const camId = `${gid}-camera-rig`;
+      const shots = memberIndices.length;
       const frame = treatment.chrome ? `<div class="chrome"><i></i><i></i><i></i><span class="url mono">${esc(brief.domain || "")}</span></div>` : "";
-      html += `<section id="${gid}" class="clip window-group" data-window-shots="${shots}" data-start="${r3(start)}" data-duration="${r3(groupEnd - start)}" data-track-index="1" style="z-index:${10 + group.start}"><div class="window-rig camera-rig" id="${rigId}"><div class="browser ${treatment.chrome ? "" : "clean-browser"}" id="${gid}-browser" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame}${treatment.chrome ? `<span class="window-count mono">${shots} views</span>` : ""}<div class="window-stage"><div class="window-camera" id="${gid}-camera"><div class="window-world" id="${gid}-world">${groupParts.join("")}</div></div>${treatment.glare ? `<div class="glare"></div>` : ""}</div></div></div></section>\n`;
+      html += `<section id="${gid}" class="clip window-group" data-window-shots="${shots}" data-start="${r3(start)}" data-duration="${r3(groupEnd - start)}" data-track-index="1" style="z-index:${10 + group.start}"><div class="window-rig camera-rig" id="${rigId}"><div class="browser ${treatment.chrome ? "" : "clean-browser"}" id="${gid}-browser" style="width:${Math.round(fw)}px;height:${Math.round(fh)}px">${frame}${treatment.chrome ? `<span class="window-count mono">${shots} views</span>` : ""}<div class="window-stage"><div class="window-camera" id="${camId}"><div class="window-world" id="${gid}-world">${groupParts.join("")}</div></div>${treatment.glare ? `<div class="glare"></div>` : ""}</div></div></div></section>\n`;
 
-      const first = waypointFor(0, W, motion, scenes[group.start].asset, scenes[group.start], shots);
-      code.push(`tl.set("#${gid}-camera",{x:${-first.x},y:${-first.y},z:${first.z},rotationX:${first.rx},rotationY:${first.ry}},${r3(groupStart)});`);
-      for (let j = group.start + 1; j <= group.end; j++) {
-        const wp = waypointFor(j - group.start, W, motion, scenes[j].asset, scenes[j], shots);
-        const moveAt = timings[j - 1].t;
-        const moveDuration = Math.max(BEAT, timings[j].t - timings[j - 1].t);
+      const first = waypointFor(0, W, motion, scenes[memberIndices[0]].asset, scenes[memberIndices[0]], shots);
+      code.push(`tl.set("#${camId}",{x:${-first.x},y:${-first.y},z:${first.z},rotationX:${first.rx},rotationY:${first.ry}},${r3(groupStart)});`);
+      let cursor = groupStart;
+      for (let k = 1; k < memberIndices.length; k++) {
+        const j = memberIndices[k];
+        const prevMember = memberIndices[k - 1];
+        const wp = waypointFor(wpIndex.get(j), W, motion, scenes[j].asset, scenes[j], shots);
+        const moveAt = Math.max(cursor, timings[j].t - BEAT);
+        const moveDuration = Math.max(BEAT, timings[j].t - moveAt);
         const revealAt = timings[j].t - Math.min(.28, timings[j].span * .18);
-        code.push(`tl.to("#${gid}-camera",{x:${-wp.x},y:${-wp.y},z:${wp.z},rotationX:${wp.rx},rotationY:${wp.ry},duration:${r3(moveDuration)},ease:"power2.inOut"},${r3(moveAt)});`);
+        code.push(`tl.to("#${camId}",{x:${-wp.x},y:${-wp.y},z:${wp.z},rotationX:${wp.rx},rotationY:${wp.ry},duration:${r3(moveDuration)},ease:"power2.inOut"},${r3(moveAt)});`);
         code.push(`tl.fromTo("#s${j}",{opacity:0,scale:.97},{opacity:1,scale:1,duration:${r3(Math.min(.28, timings[j].span * .18))},ease:"power2.out"},${r3(revealAt)});`);
-        code.push(`tl.to("#s${j - 1}",{opacity:0,duration:${r3(Math.min(.24, timings[j - 1].span * .16))},ease:"power2.in"},${r3(revealAt + .05)});`);
+        code.push(`tl.to("#s${prevMember}",{opacity:0,duration:${r3(Math.min(.24, timings[prevMember].span * .16))},ease:"power2.in"},${r3(revealAt + .05)});`);
+        cursor = moveAt + moveDuration;
       }
-      if (group.end > group.start) {
-        const last = waypointFor(group.end - group.start, W, motion, scenes[group.end].asset, scenes[group.end], shots);
-        code.push(`tl.to("#${gid}-camera",{x:${-last.x},y:${-last.y},z:${last.z},rotationX:${last.rx},rotationY:${last.ry},duration:${r3(Math.min(motion.settle, timings[group.end].span * .25))},ease:"power2.out"},${r3(timings[group.end].end)});`);
+      {
+        const lastIdx = memberIndices[memberIndices.length - 1];
+        const tailAt = Math.min(cursor, groupEnd - BEAT);
+        const tailDuration = Math.max(BEAT, groupEnd - tailAt - 0.02);
+        const last = waypointFor(memberIndices.length - 1, W, motion, scenes[lastIdx].asset, scenes[lastIdx], shots);
+        const push = Math.max(1, Math.round(W * 0.02 * (motion.depth || 1)));
+        code.push(`tl.to("#${camId}",{x:${-last.x - push},y:${-last.y},z:${last.z - Math.round(push * 1.6)},rotationX:${last.rx},rotationY:${last.ry},duration:${r3(tailDuration)},ease:"sine.inOut"},${r3(tailAt)});`);
       }
       if (group.start > 0) {
         ctx.dir = group.start % 2 ? 1 : -1;
@@ -798,18 +1148,44 @@ export function compose(brief, plan, opts = {}) {
     ctx.windowed = false;
     ctx.timing = shotPlan;
     ctx.motionSpec = shotMotion(sc, i, sc.type, motion, rand);
+    if (sc.type === "feature" && sc.ordinal == null) { ctx.featureOrdinal = (ctx.featureSeen = (ctx.featureSeen || 0)); ctx.featureSeen += 1; }
     const built = B[sc.type](sc, id, t0, i, isLast, duration);
-    html += `<section id="${id}" class="clip scene t-${sc.type}" data-start="${r3(start)}" data-duration="${r3(end - start)}" data-shot-duration="${r3(shotPlan.span)}" data-hold="${r3(shotPlan.hold)}" data-motion-intent="${esc(ctx.motionSpec.intent)}" data-track-index="${1 + (i % 2)}" style="z-index:${10 + i}"><div class="sc" id="${id}-sc"><div class="ground"></div><div class="motion-stage" id="${id}-motion">${built.html}</div></div></section>\n`;
+    const absorbed = Boolean(group && !isProductScene(i));
+    html += `<section id="${id}" class="clip scene t-${sc.type}" data-start="${r3(start)}" data-duration="${r3(end - start)}" data-shot-duration="${r3(shotPlan.span)}" data-hold="${r3(shotPlan.hold)}" data-motion-intent="${esc(ctx.motionSpec.intent)}" data-quiet="${shotPlan.quiet ? 1 : 0}" data-track-index="${1 + (i % 2)}" style="z-index:${10 + i}"><div class="sc" id="${id}-sc"><div class="ground"></div><div class="motion-stage" id="${id}-motion">${built.html}</div></div></section>\n`;
     code.push(`// ${i} ${sc.type}`, ...built.code.filter(Boolean), ...shotMotionCode(id, t0, shotPlan, ctx.motionSpec));
     (built.hits || []).forEach((h) => cues.push({ ...h, scene: i }));
-    if (i > 0) {
+    if (i > 0 && !absorbed) {
       ctx.dir = i % 2 ? 1 : -1;
       const k = trans[i];
       code.push(...transitionCode(k, `#s${i - 1}-sc`, `#${id}-sc`, t0, ctx));
       if (TRANSITION_SFX[k]) cues.push({ t: t0 - 0.12, sfx: TRANSITION_SFX[k], gain: 0.5, scene: i, transition: k });
     }
-    sceneMeta.push({ i, type: sc.type, t: t0, duration: shotPlan.span, hold: shotPlan.hold, asset: sc.asset?.id || null, motion: ctx.motionSpec.intent, transition: trans[i], label: sceneLabel(sc) });
+    sceneMeta.push({ i, type: sc.type, t: t0, duration: shotPlan.span, hold: shotPlan.hold, asset: sc.asset?.id || null, motion: ctx.motionSpec.intent, transition: absorbed ? "camera" : trans[i], label: sceneLabel(sc) });
   });
+
+  const fingerprint = scenes.map((s) => s.type).join(">");
+  sceneMeta.sort((a, b) => a.i - b.i);
+  let productSeconds = 0;
+  scenes.forEach((sc, i) => {
+    const a = sc.type === "matchcut" ? (sc.fromAsset || sc.toAsset || sc.asset) : sc.asset;
+    if (PRODUCT_SCENE_TYPES.has(sc.type) && a?.url) productSeconds += timings[i].span;
+  });
+  productSeconds = r3(productSeconds);
+  let continuousShotSeconds = 0;
+  windowGroups.forEach((g) => {
+    const members = [];
+    for (let j = g.start; j <= g.end; j++) if (isProductScene(j)) members.push(j);
+    if (!members.length) return;
+    const t = timings[members[0]].t;
+    const end = timings[g.end].end;
+    if (end - t > continuousShotSeconds) continuousShotSeconds = end - t;
+  });
+  continuousShotSeconds = r3(Math.max(0, continuousShotSeconds));
+  const firstContent = scenes.find((sc) => sc.type !== "coldopen" && (sc.asset?.url || sc.text || sc.word || sc.title || sc.value || sc.caption));
+  const firstContentAt = r3(firstContent ? timings[scenes.indexOf(firstContent)].t : 0);
+  const statsCount = scenes.filter((s) => s.type === "stat").length;
+  const aspectMatches = W === (ASPECTS[aspect] || ASPECTS["16:9"])[0] && H === (ASPECTS[aspect] || ASPECTS["16:9"])[1];
+  const checks = { productSeconds, continuousShotSeconds, firstContentAt, statsCount, aspectMatches };
 
   const grainSteps = [];
   if (treatment.grain > 0) for (let t = 0; t < duration; t += 1 / 12) grainSteps.push(`tl.set("#fx-grain",{backgroundPosition:"${Math.floor(rand.next() * 200)}px ${Math.floor(rand.next() * 200)}px"},${r3(t)});`);
@@ -854,7 +1230,7 @@ ${audioTag}
 </script>
 </body>
 </html>`;
-  return { html: doc, duration, width: W, height: H, cues, scenes: sceneMeta, style: styleKey, palette: P, bpm: 160, soundProfile: motion.soundProfile };
+  return { html: doc, duration, width: W, height: H, cues, scenes: sceneMeta, style: styleKey, palette: P, bpm: 160, soundProfile: motion.soundProfile, fingerprint, checks };
 }
 
 function sceneLabel(sc) {
@@ -981,5 +1357,34 @@ html,body{width:${W}px;height:${H}px;overflow:hidden;background:${P.bg}}
 .rec{width:${Math.round(u * 0.9)}px;height:${Math.round(u * 0.9)}px;border-radius:50%;background:var(--accent)}
 .hud-bar{position:absolute;left:${Math.round(W * 0.04)}px;right:${Math.round(W * 0.04)}px;top:${Math.round(u * 6.2)}px;height:2px;background:rgba(${S.dark ? "255,255,255" : "0,0,0"},.1)}
 .hud-bar i{display:block;height:100%;background:var(--accent);transform-origin:0 50%}
+.rig-cam{perspective:${Math.round(W * 1.4)}px}
+.fly-rig{position:absolute;left:50%;top:50%;transform-style:preserve-3d;will-change:transform,opacity}
+.fly-rig .browser{position:absolute;left:0;top:0;transform-origin:50% 50%;transform-style:preserve-3d;translate:-50% -50%}
+.scrim{position:absolute;inset:0;background:radial-gradient(80% 70% at 50% 50%, transparent 20%, ${S.dark ? "rgba(0,0,0,.72)" : "rgba(0,0,0,.42)"} 100%);pointer-events:none;opacity:0}
+.depth-cam{perspective:${Math.round(W * 1.4)}px;transform-style:preserve-3d}
+.depth-bg{position:absolute;inset:${Math.round(u * 3)}px;border-radius:${Math.round(u * 2)}px;overflow:hidden;box-shadow:0 ${Math.round(u * 4)}px ${Math.round(u * 12)}px rgba(0,0,0,${S.dark ? 0.5 : 0.24})}
+.depth-bg .shot{top:0!important}
+.depth-fg{position:absolute;inset:-2% -6%;display:grid;place-items:center;background:linear-gradient(0deg, ${P.bg} 62%, ${mix(P.bg, P.field, S.dark ? 0.22 : 0.14)} 100%);will-change:transform,clip-path}
+.depth-type{color:var(--fg);text-align:center;padding:0 ${Math.round(W * 0.06)}px;line-height:.96;text-shadow:0 ${Math.round(u * 0.4)}px ${Math.round(u * 2)}px ${S.dark ? "rgba(0,0,0,.5)" : "rgba(255,255,255,.4)"}}
+.depth-rule{position:absolute;left:50%;top:64%;width:${Math.round(u * 16)}px;height:${Math.max(3, Math.round(u * 0.5))}px;margin-left:-${Math.round(u * 8)}px;background:var(--accent);transform-origin:50% 50%}
+.match-wrap{perspective:${Math.round(W * 1.4)}px}
+.match-stage{position:absolute;left:${Math.round(W * 0.06)}px;right:${Math.round(W * 0.06)}px;top:${Math.round(H * 0.08)}px;bottom:${Math.round(H * 0.08)}px;border-radius:${Math.round(u * 2)}px;overflow:hidden;transform-style:preserve-3d;will-change:transform;box-shadow:0 ${Math.round(u * 5)}px ${Math.round(u * 14)}px rgba(0,0,0,${S.dark ? 0.55 : 0.28})}
+.match-layer{position:absolute;inset:0;overflow:hidden;will-change:transform,clip-path}
+.match-layer .shot{top:0!important}
+.match-layer.match-in{z-index:2;background:${P.bg}}
+.match-flash{position:absolute;inset:0;background:var(--accent);opacity:0;pointer-events:none;mix-blend-mode:screen}
+.track-cam{padding:0}
+.track-rig{position:absolute;inset:0;overflow:hidden;background:${S.dark ? mix(P.bg, "#000000", 0.12) : mix(P.bg, P.field, 0.08)}}
+.track-stage{position:absolute;top:${Math.round(H * 0.14)}px;bottom:${Math.round(H * 0.14)}px;left:${Math.round(-W * 0.05)}px;width:${Math.round(W * 1.5)}px;border-radius:${Math.round(u * 1.6)}px;overflow:hidden;transform-style:preserve-3d;will-change:transform;box-shadow:0 ${Math.round(u * 4)}px ${Math.round(u * 12)}px rgba(0,0,0,${S.dark ? 0.5 : 0.26})}
+.track-browser{position:absolute;inset:0;border-radius:0;box-shadow:none;overflow:hidden;background:var(--surface)}
+.track-band{position:absolute;inset:0;overflow:hidden}
+.track-img{display:block;width:128%;height:100%;object-fit:cover}
+.track-ghost{position:absolute;inset:0;width:128%;height:100%}
+.track-para{position:absolute;left:0;right:0;top:${Math.round(H * 0.06)}px;display:flex;justify-content:center;pointer-events:none;will-change:transform}
+.track-chip{display:inline-flex;align-items:center;gap:${Math.round(u)}px;padding:${Math.round(u * 1.1)}px ${Math.round(u * 2.6)}px;border-radius:99px;background:var(--surface);border:1px solid rgba(${S.dark ? "255,255,255" : "0,0,0"},.12);font-family:"${S.mono}",monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--fg);box-shadow:0 ${Math.round(u)}px ${Math.round(u * 4)}px rgba(0,0,0,${S.dark ? 0.4 : 0.12})}
+.track-chip b{width:${Math.round(u * 0.9)}px;height:${Math.round(u * 0.9)}px;border-radius:50%;background:var(--accent)}
+.track-cap{position:absolute;left:0;right:0;bottom:${Math.round(u * 2)}px;text-align:center;color:var(--fg);text-shadow:0 ${Math.round(u * 0.4)}px ${Math.round(u * 2)}px ${S.dark ? "rgba(0,0,0,.6)" : "rgba(255,255,255,.6)"}}
+.track-glare{position:absolute;inset:0;background:linear-gradient(100deg,transparent 42%,rgba(255,255,255,.14) 50%,transparent 58%);pointer-events:none}
+.rig-cursor{z-index:5}
 `;
 }
