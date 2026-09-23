@@ -19,8 +19,10 @@ function briefForDirector(brief) {
     name: clean(brief.name, 60), domain: clean(brief.domain, 120), headline: clean(brief.headline, 160), description: clean(brief.description, 360), category: clean(brief.category, 80),
     cta: clean(brief.cta, 90),
     ctaCandidates: Array.isArray(brief.ctaCandidates) ? brief.ctaCandidates.slice(0, 8).map((value) => clean(value, 90)) : [],
-    features: Array.isArray(brief.features) ? brief.features.slice(0, 8).map((feature) => ({ title: clean(typeof feature === "string" ? feature : feature.title, 80), desc: clean(feature?.desc, 140) })) : [],
-    stats: Array.isArray(brief.stats) ? brief.stats.slice(0, 4).map((stat) => ({ value: clean(stat.value, 20), label: clean(stat.label, 80) })) : [],
+    features: Array.isArray(brief.featureCatalog) && brief.featureCatalog.length
+      ? brief.featureCatalog.slice(0, 16).map((feature) => ({ title: clean(feature.title, 80), desc: clean(feature.desc, 160), weight: Number(feature.weight) || 0 }))
+      : Array.isArray(brief.features) ? brief.features.slice(0, 16).map((feature) => ({ title: clean(typeof feature === "string" ? feature : feature.title, 80), desc: clean(feature?.desc, 160) })) : [],
+    stats: Array.isArray(brief.stats) ? brief.stats.slice(0, 8).map((stat) => ({ value: clean(stat.value, 20), label: clean(stat.label, 80) })) : [],
     quotes: Array.isArray(brief.quotes) ? brief.quotes.slice(0, 2).map((quote) => ({ text: clean(quote.text, 160), author: clean(quote.author, 60) })) : [],
     logos: Array.isArray(brief.logos) ? brief.logos.slice(0, 6).map((logo) => clean(logo, 40)) : [],
     screenshots: Array.isArray(brief.screenshots) ? brief.screenshots.slice(0, 24) : [],
@@ -105,6 +107,8 @@ const SYSTEM = [
   "You are Snapmy.site's senior creative director. Return only JSON, no prose.",
   "Use only facts present in the brief. Never invent pricing, customers, or features.",
   "Produce 12-20 scenes as {\"scenes\":[...]}. Allowed scene types: coldopen, hook, statement, flashword, screen, scroll, feature, featureStack, stat, quote, logos, marquee, split, cta, endcard.",
+  "The brief's \"features\" catalog may contain more entries than you need. Read all of them, then pick only the strongest 3-5 for the video: prefer specific, differentiated capabilities over generic marketing phrases. Cover the product's most important capabilities and drop the rest. Never invent features that are not in the catalog.",
+  "Use feature scenes for the ones you pick, and use featureStack to compress related capabilities into one beat.",
   "INCLUDE AT LEAST 3 scenes of type screen, scroll, or split so the real website screenshots are used as evidence. Set their \"shot\" to the index of the most relevant screenshot (0-based, within the count given in the brief).",
   "SCENE FIELD RULES (a scene must use exactly the fields for its type):",
   "coldopen/flashword -> {\"type\",\"word\"}",

@@ -319,7 +319,7 @@ function pairFeatures(headings, paragraphs) {
   const scored = candidates.map((candidate) => ({ ...candidate, score: scoreFeature(candidate.title, candidate.desc, candidate.index) }))
     .filter((candidate) => candidate.score > 4)
     .sort((a, b) => b.score - a.score);
-  return scored.slice(0, 6).map(({ title, desc }) => ({ title, desc: desc || "" }));
+  return scored.slice(0, 24).map(({ title, desc, score }) => ({ title, desc: desc || "", weight: Number(score.toFixed(2)) }));
 }
 
 function brandColors(rawColors) {
@@ -530,13 +530,14 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
   const headline = pickHeadline(home) || home.title || normalized.hostname;
   const name = cleanBrandTitle(home.title || normalized.hostname, normalized.hostname);
   const headlineKey = cleanText(headline).toLowerCase();
-  const features = pairFeatures(allHeadings, allParagraphs)
-    .filter((feature) => cleanText(feature.title).toLowerCase() !== headlineKey)
-    .slice(0, 4);
+  const allFeatures = pairFeatures(allHeadings, allParagraphs)
+    .filter((feature) => cleanText(feature.title).toLowerCase() !== headlineKey);
+  const features = allFeatures.slice(0, 4);
+  const featureCatalog = allFeatures.slice(0, 16);
   const allStats = [];
   for (const page of pages) {
     for (const stat of page.stats) {
-      if (allStats.length >= 6) break;
+      if (allStats.length >= 12) break;
       const key = stat.value.toLowerCase();
       if (allStats.some((existing) => existing.value.toLowerCase() === key)) continue;
       if (/(?:^| )\$(?:0|100|17|20|200)(?:\b|$)/.test(stat.value) && /(?:more usage|than pro|from\b)/i.test(stat.label)) continue;
@@ -544,6 +545,7 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
       allStats.push(stat);
     }
   }
+  const stats = allStats.slice(0, 6);
   const allQuotes = pages.flatMap((page) => page.quotes).filter((quote) => quote.text && quote.text.length > 20).slice(0, 4);
   const allLogos = collectLogos(pages);
   const logo = home.logo || "";
@@ -579,7 +581,8 @@ function buildBrief(normalized, pages, candidates, diagnostics, providerConfigur
     description: clipped(home.description || allParagraphs[0] || "", 360),
     category: inferCategory(`${name} ${headline} ${home.description} ${features.map((feature) => feature.title).join(" ")}`),
     features,
-    stats: allStats,
+    featureCatalog,
+    stats,
     quotes: allQuotes,
     logos: allLogos,
     colors,
