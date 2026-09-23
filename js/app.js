@@ -31,12 +31,11 @@ function samplePlan(s) {
     { type: "coldopen", word: b.name },
     { type: "hook", words: hookWords },
     { type: "statement", text: b.description, kicker: b.category || "Launch" },
-    { type: "flashword", word: b.headline.split(/\s+/).sort((x, y) => y.length - x.length)[0] },
     ...f.slice(0, 3).map((x, i) => ({ type: "feature", title: x.title, sub: x.desc, index: i, transition: i === 0 ? (STYLES[s.style].accents.includes("flash") ? "flash" : "zoom") : undefined })),
     ...(f.length >= 3 ? [{ type: "featureStack", items: f.slice(0, 3).map((x) => x.title) }] : []),
     ...st2.slice(0, 2).map((x) => ({ type: "stat", value: x.value, label: x.label })),
     { type: "marquee", text: b.name },
-    { type: "statement", text: b.headline, accent: b.headline.split(/\s+/).pop() },
+    { type: "split", text: b.headline },
     { type: "cta", text: b.cta || "Get started", button: b.cta || "Get started" },
     { type: "endcard", text: b.description },
   ];
@@ -46,7 +45,7 @@ const briefOf = (s) => ({ ...s.brief, features: s.brief.features, colors: s.brie
 
 async function heroInit() {
   const hp = $("heroPlayer"); if (!hp) return;
-  const s = SAMPLES[1];
+  const s = SAMPLES[0];
   const brief = briefOf(s), plan = samplePlan(s);
   const base = compose(brief, plan, { aspect: "16:9" });
   hp.setAttribute("srcdoc", base.html);
@@ -76,14 +75,16 @@ function reelInit() {
   let active = null;
   SAMPLES.forEach((s, i) => {
     const P = palette({ colors: s.brief.colors }, STYLES[s.style]);
+    const aspect = s.aspect || "16:9";
     const fig = document.createElement("figure");
-    fig.innerHTML = `<div class="frame" tabindex="0" role="button" aria-label="Play ${s.brief.name} sample"><div class="poster" style="--pbg:${P.bg};--pc:${P.field};color:${P.fg}"><i></i><small>${STYLES[s.style].label} · ${s.note}</small><b>${s.brief.headline}</b></div><span class="play-hint">Hover to play</span></div><figcaption><b>${s.brief.name}</b><span class="muted">${s.brief.domain}</span></figcaption>`;
+    fig.className = `fig fig--${aspect.replace(":", "-")}`;
+    fig.innerHTML = `<div class="frame" tabindex="0" role="button" aria-label="Play ${s.brief.name} sample"><div class="poster" style="--pbg:${P.bg};--pc:${P.field};--pfg:${P.fg}"><i></i><span class="poster-tag mono small">${STYLES[s.style].label} · ${s.note}</span><b>${s.brief.headline}</b></div><span class="poster-ratio mono small">${aspect}</span><span class="play-hint mono small">Play</span></div><figcaption><b>${s.brief.name}</b><span class="muted">${s.brief.domain}</span></figcaption>`;
     const frame = fig.querySelector(".frame");
     const play = () => {
       if (active && active !== frame) { active.querySelector("hyperframes-player")?.remove(); active.classList.remove("playing"); }
       if (!frame.querySelector("hyperframes-player")) {
         const p = document.createElement("hyperframes-player"); p.className = "hfp"; p.setAttribute("muted", ""); p.setAttribute("loop", ""); p.setAttribute("autoplay", "");
-        p.setAttribute("srcdoc", compose(briefOf(s), samplePlan(s), { aspect: "16:9" }).html); frame.prepend(p);
+        p.setAttribute("srcdoc", compose(briefOf(s), samplePlan(s), { aspect }).html); frame.prepend(p);
         p.addEventListener("ready", () => frame.classList.add("playing"), { once: true });
       } else { frame.classList.add("playing"); frame.querySelector("hyperframes-player").play?.(); }
       active = frame;
