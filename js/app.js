@@ -141,7 +141,7 @@ async function run(url) {
   if (st.backend) {
      log("Finding the strongest story angle");
      log("Shaping the film direction around your product");
-     try { const d = await api("/direct", { brief }, { timeout: 70000 }); decisions = d.decisions && d.decisions.style ? d.decisions : null; raw = d.plan; if (d.errors?.jev) log("Direction note: " + d.errors.jev.slice(0, 80), "warn"); if (d.errors?.kimi) log("Creative note: " + d.errors.kimi.slice(0, 80), "warn"); } catch (e) { log("Direction call failed: " + e.message, "err"); }
+     try { const d = await api("/direct", { brief }, { timeout: 70000 }); decisions = d.decisions && d.decisions.style ? d.decisions : null; raw = d.plan; if (d.errors?.jev) log("Direction note: " + d.errors.jev.slice(0, 80), "warn"); const creative = d.errors ? Object.entries(d.errors).find(([key]) => key !== "jev") : null; if (creative) log("Creative note: " + creative[1].slice(0, 80), "warn"); } catch (e) { log("Direction call failed: " + e.message, "err"); }
   }
   if (!decisions) { decisions = guessDecisions(brief); log("Using the built-in style guess: " + STYLES[decisions.style].label, "warn"); }
    else log(`Direction set → ${STYLES[decisions.style]?.label || decisions.style}`, "ok");
