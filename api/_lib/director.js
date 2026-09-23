@@ -113,7 +113,7 @@ async function kimiPlan(brief, decisions) {
       method: "POST",
       signal: controller.signal,
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "moonshot-v1-8k", temperature: 0.35, response_format: { type: "json_object" }, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+      body: JSON.stringify({ model: "kimi-k2.6", thinking: { type: "disabled" }, response_format: { type: "json_object" }, max_completion_tokens: 2048, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
     });
      if (!response.ok) return { plan: null, error: `http_${response.status}` };
      const payload = await response.json();
